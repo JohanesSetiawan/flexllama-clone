@@ -216,14 +216,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Timetracker
-.timetracker
-
 # Logs
 logs/
 *.log
 
-# Project specific excludes
+# Timetracker
+.timetracker
+
+# Exludes
 config.json
 configOriginal.json
-.timetracker
