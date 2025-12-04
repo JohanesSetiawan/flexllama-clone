@@ -1,5 +1,8 @@
+import gc
+import os
 import time
 import httpx
+import signal
 import asyncio
 import logging
 import subprocess
@@ -7,12 +10,18 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from .metrics import metrics
+from .vram_tracker import VRAMTracker
+from .errors import InsufficientVRAMError
 from .config import AppConfig, ModelConfig
+from .gguf_utils import get_optimal_parallel, get_model_info
 
 logger = logging.getLogger(__name__)
 
 
 class RunnerProcess:
+    # Global cache: {model_path: (parallel, model_info)}
+    _gguf_cache: Dict[str, tuple] = {}
+
     def __init__(self, alias: str, config: ModelConfig, port: int, llama_server_path: str, system_config):
         self.alias = alias
         self.config = config
@@ -58,20 +67,55 @@ class RunnerProcess:
         self.status = "starting"
 
         params = self.config.params
+        model_path = self.config.model_path
+
+        if model_path in self._gguf_cache:
+            parallel, model_info = self._gguf_cache[model_path]
+            logger.debug(f"[{self.alias}] Using cached GGUF metadata")
+        else:
+            # Determine optimal parallel setting using GGUF metadata
+            base_parallel = params.parallel_override if params.parallel_override else self.system_config.parallel_requests
+
+            parallel, parallel_reason = get_optimal_parallel(
+                model_path=model_path,
+                n_ctx=params.n_ctx,
+                default_parallel=base_parallel,
+                min_ctx_per_slot=2048
+            )
+
+            if parallel != base_parallel:
+                logger.info(f"[{self.alias}] {parallel_reason}")
+
+        # Get model info
+        model_info = get_model_info(model_path)
+
+        # Cache it
+        self._gguf_cache[model_path] = (parallel, model_info)
+
+        # Log model info for debugging
+        if model_info:
+            swa_status = f"SWA={model_info.swa_window_size}" if model_info.is_swa else "non-SWA"
+            logger.info(
+                f"[{self.alias}] Model: {model_info.name} | Arch: {model_info.architecture} | SWA Status: {swa_status} | Layers: {model_info.block_count} | Parallel: {parallel}"
+            )
+
         command = [
             self.llama_server_path, "--model", self.config.model_path,
             "--host", "127.0.0.1", "--port", str(self.port),
             "--n-gpu-layers", str(params.n_gpu_layers),
             "--ctx-size", str(params.n_ctx), "--mlock",
-            "--rope-freq-base", str(params.rope_freq_base), "-nkvo"
+            "--context-shift"
         ]
+
+        # RoPE frequency base (hanya jika di-set, biarkan default model jika None)
+        if params.rope_freq_base is not None and params.rope_freq_base > 0:
+            command.extend(["--rope-freq-base", str(params.rope_freq_base)])
 
         # Batch size (with per-model override)
         batch_size = params.batch_override if params.batch_override else params.n_batch
         command.extend(["--batch-size", str(batch_size)])
 
-        # Parallel requests (with per-model override)
-        parallel = params.parallel_override if params.parallel_override else self.system_config.parallel_requests
+        # Parallel requests (already adjusted above for SWA models)
         command.extend(["--parallel", str(parallel)])
 
         # CPU threads
@@ -99,13 +143,22 @@ class RunnerProcess:
         if params.type_v and params.type_v.lower() != "none":
             command.extend(["--cache-type-v", params.type_v])
 
-        logger.info(f"[{self.alias}] di Port {self.port}.")
-        logger.debug(f"[{self.alias}] Command: {' '.join(command)}")
-        logger.info(f"[{self.alias}] Log file: {self.log_file}")
-        logger.info(
-            f"[{self.alias}] Performance: threads={self.system_config.cpu_threads}, "
-            f"flash_attn={self.system_config.flash_attention}, mmap={self.system_config.use_mmap}"
-        )
+        model_size_gb = Path(self.config.model_path).stat().st_size / (1024**3)
+
+        if model_info and model_info.block_count > 20:
+            logger.info(
+                f"[{self.alias}] Large model detected ({model_size_gb:.1f} GB). Performing memory cleanup."
+            )
+
+            # Force garbage collection
+            gc.collect()
+
+            # Small delay to allow system to stabilize
+            await asyncio.sleep(0.5)
+
+            logger.info(
+                f"[{self.alias}] Memory cleanup complete. Starting load.")
+
         self.startup_error = None
 
         # Buka log file untuk stdout dan stderr
@@ -136,40 +189,119 @@ class RunnerProcess:
         self.status = "ready"
 
         logger.info(
-            f"[{self.alias}] READY at {self.url} | "
-            f"Total: {total_startup_time:.2f}s "
-            f"(subprocess: {subprocess_time:.2f}s, loading: {health_check_time:.2f}s)"
+            f"[{self.alias}] READY at {self.url} | Total: {total_startup_time:.2f}s | (subprocess: {subprocess_time:.2f}s, loading: {health_check_time:.2f}s)"
         )
 
     async def stop(self):
+        """
+        Stop the runner process gracefully with escalating termination strategy.
+
+        Strategy:
+        1. SIGTERM (graceful) - wait up to 15 seconds
+        2. SIGKILL (force) - if SIGTERM times out
+        3. os.kill() as last resort for processes if models are still alive
+        """
         if not self.is_alive() or self.process is None:
             self.status = "stopped"
+            logger.debug(f"[{self.alias}] Process already stopped or None.")
             return
+
+        pid = self.process.pid
         logger.info(
-            f"[{self.alias}] Menghentikan proses (Port {self.port}).")
+            f"[{self.alias}] Menghentikan proses (Port {self.port}, PID {pid}).")
+
         try:
+            # Step 1: Try graceful termination with SIGTERM
             self.process.terminate()
-            await asyncio.wait_for(self.process.wait(), timeout=10.0)
-            logger.info(f"[{self.alias}] Berhasil dihentikan.")
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[{self.alias}] Gagal terminate.")
-            self.process.kill()
-            await self.process.wait()
+            logger.debug(
+                f"[{self.alias}] Sent SIGTERM, waiting for graceful shutdown...")
 
-        self.process = None
-        self.status = "stopped"
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=15.0)
+                logger.info(f"[{self.alias}] Berhasil dihentikan (graceful).")
+            except asyncio.TimeoutError:
+                # Step 2: SIGTERM timeout, escalate to SIGKILL via asyncio
+                logger.warning(
+                    f"[{self.alias}] SIGTERM timeout (15s). Escalating to SIGKILL...")
 
-        # Close log file handle
-        if hasattr(self, 'log_handle'):
-            self.log_handle.close()
+                try:
+                    self.process.kill()
+                    await asyncio.wait_for(self.process.wait(), timeout=5.0)
+                    logger.info(
+                        f"[{self.alias}] Berhasil dihentikan (force kill).")
+                except asyncio.TimeoutError:
+                    # Step 3: Last resort - use os.kill directly
+                    logger.warning(
+                        f"[{self.alias}] asyncio SIGKILL timeout. Trying os.kill() directly on PID {pid}...")
+
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        # Give it a moment
+                        await asyncio.sleep(1.0)
+
+                        # Check if process is really dead
+                        try:
+                            # Signal 0 = check if process exists
+                            os.kill(pid, 0)
+                            logger.error(
+                                f"[{self.alias}] Process PID {pid} masih hidup setelah os.kill(). Mungkin zombie atau kernel issue."
+                            )
+                        except OSError:
+                            # Process is dead (OSError means process doesn't exist)
+                            logger.info(
+                                f"[{self.alias}] Berhasil dihentikan via os.kill().")
+                    except ProcessLookupError:
+                        logger.info(
+                            f"[{self.alias}] Process sudah mati sebelum os.kill().")
+                    except Exception as e:
+                        logger.error(
+                            f"[{self.alias}] os.kill() error: {e}")
+
+                except Exception as e:
+                    logger.error(f"[{self.alias}] Error during SIGKILL: {e}")
+
+        except ProcessLookupError:
+            # Process already dead
+            logger.info(
+                f"[{self.alias}] Process sudah tidak ada (already dead).")
+        except Exception as e:
+            logger.error(f"[{self.alias}] Unexpected error during stop: {e}")
+        finally:
+            # Always cleanup
+            self.process = None
+            self.status = "stopped"
+
+            # Close log file handle
+            if hasattr(self, 'log_handle') and self.log_handle:
+                try:
+                    self.log_handle.close()
+                except Exception as e:
+                    logger.debug(
+                        f"[{self.alias}] Error closing log handle: {e}")
 
     async def _wait_for_ready(self, timeout=120):
         self.status = "loading"
         start_time = time.time()
         last_log_time = 0
 
+        # Adaptive polling intervals
+        poll_intervals = [
+            0.05,   # 50ms - very fast initial checks
+            0.05,
+            0.1,    # 100ms
+            0.1,
+            0.2,    # 200ms
+            0.2,
+            0.5,    # 500ms - for slower loads
+            0.5,
+            1.0,    # 1s - fallback for very slow loads
+            1.0
+        ]
+        poll_index = 0
+        max_fast_polls = len(poll_intervals)
+
         async with httpx.AsyncClient() as client:
+            iteration = 0
             while time.time() - start_time < timeout:
                 if not self.is_alive():
                     try:
@@ -177,46 +309,75 @@ class RunnerProcess:
                             lines = f.readlines()
                             self.startup_error = ''.join(lines)
                     except Exception as e:
-                        self.startup_error = f"Proses crash, gagal membaca log: {e}"
+                        self.startup_error = f"Process crashed, cannot read log: {e}"
 
                     self.status = "crashed"
                     logger.error(
-                        f"[{self.alias}] | Crash. Error: {self.startup_error}")
+                        f"[{self.alias}] Crashed. Error: {self.startup_error}...")
                     raise Exception(
-                        f"Gagal memulai model. Error: {self.startup_error}")
+                        f"Failed to start model. Error: {self.startup_error}...")
 
                 try:
-                    response = await client.get(f"{self.url}/health", timeout=1.0)
-                    if response.status_code == 200:
+                    # Use shorter timeout for health check
+                    response = await client.get(f"{self.url}/health", timeout=0.5)
+
+                    if response.status_code == 200:  # Ready
+                        elapsed = time.time() - start_time
                         self.status = "ready"
+                        logger.info(
+                            f"[{self.alias}] READY in {elapsed:.2f}s (after {iteration} health checks)")
                         return
-                    elif response.status_code == 503:
+
+                    elif response.status_code == 503:  # Model loading
                         current_time = time.time()
 
-                        if current_time - last_log_time >= 5.0:
+                        if current_time - last_log_time >= 3.0:  # Log progress every 3 seconds
                             elapsed = current_time - start_time
                             logger.info(
-                                f"[{self.alias}] Loading... ({elapsed:.1f}s elapsed)")
+                                f"[{self.alias}] Loading... ({elapsed:.1f}s elapsed, status 503)")
                             last_log_time = current_time
 
                         self.status = "loading"
-                        await asyncio.sleep(1.0)
+
                     else:
                         logger.warning(
-                            f"[{self.alias}] | Status {response.status_code}.")
-                        await asyncio.sleep(1.0)
-                except httpx.ConnectError:
-                    logger.info(
-                        f"[{self.alias}] | Gagal terhubung - menunggu.")
-                    self.status = "starting"
-                    await asyncio.sleep(0.5)
+                            f"[{self.alias}] Unexpected status: {response.status_code}")
 
-            await self.stop()
-            self.status = "crashed"
-            raise TimeoutError(
-                f"Runner {self.alias} gagal start dalam {timeout} detik (timeout)."
-                f"Check log di {self.log_file}"
-            )
+                except httpx.ConnectError:  # Connection refused
+                    current_time = time.time()
+
+                    if current_time - last_log_time >= 5.0:
+                        elapsed = current_time - start_time
+                        logger.debug(
+                            f"[{self.alias}] Waiting for server to start... ({elapsed:.1f}s)")
+                        last_log_time = current_time
+
+                    self.status = "starting"
+
+                except httpx.TimeoutException:  # Health check timeout
+                    logger.debug(
+                        f"[{self.alias}] Health check timeout")
+
+            # Adaptive sleep - fast at first, slower later
+            if poll_index < max_fast_polls:
+                sleep_time = poll_intervals[poll_index]
+                poll_index += 1
+            else:
+                # After fast polling phase, use 1 second interval
+                sleep_time = 1.0
+
+            await asyncio.sleep(sleep_time)
+            iteration += 1
+
+        # Timeout reached
+        elapsed = time.time() - start_time
+        logger.error(
+            f"[{self.alias}] Failed to start after {elapsed:.1f}s (timeout: {timeout}s)")
+
+        await self.stop()
+        self.status = "crashed"
+        raise TimeoutError(
+            f"Runner {self.alias} failed to start within {timeout} seconds.")
 
 
 class ModelManager:
@@ -234,6 +395,11 @@ class ModelManager:
 
         # {model_alias: {error: str, attempts: int}}
         self.failed_models: Dict[str, Dict] = {}
+
+        # VRAM Tracker initialization
+        self.vram_tracker = VRAMTracker(gpu_device_index=self.gpu_devices[0])
+        self.vram_tracker.start_monitoring()
+        logger.info("VRAM Tracker initialized and monitoring started")
 
         self.check_task = asyncio.create_task(self._idle_check_watchdog())
 
@@ -272,45 +438,48 @@ class ModelManager:
                 runners_to_stop = []
 
                 async with self.lock:
-                    active_aliases = list(self.active_runners.keys())
+                    for alias, runner in list(self.active_runners.items()):
+                        # Check shutdown
+                        if self.shutdown_event.is_set():
+                            return
 
-                for alias in active_aliases:
-                    # Check shutdown sebelum process setiap runner
-                    if self.shutdown_event.is_set():
-                        return
-
-                    async with self.lock:
-                        runner = self.active_runners.get(alias)
-                        if runner is None:
+                        # Skip jika runner sudah mati - akan di-cleanup saat request berikutnya
+                        if not runner.is_alive():
+                            logger.debug(
+                                f"[Idle Watchdog] Skipping dead runner '{alias}'"
+                            )
                             continue
 
                         # Jika stuck di loading terlalu lama, stop
                         if runner.status in ["loading", "starting"]:
                             if runner.started_time and (current_time - runner.started_time) > max_time:
                                 logger.warning(
-                                    f"Model '{alias}' stuck di status '{runner.status}' "
-                                    f"lebih dari {max_time}s. Forcing stop."
+                                    f"Model '{alias}' stuck di status '{runner.status}' lebih dari {max_time}s. Forcing stop."
                                 )
-                                port = runner.port
-                                await runner.stop()
-                                self._release_port(port)
-                                runners_to_stop.append(alias)
+                                runners_to_stop.append((alias, runner.port))
                             continue
 
                         # Check idle timeout untuk model yang ready
-                        if (current_time - runner.last_used_time) > timeout:
-                            logger.info(
-                                f"Model '{alias}' melebihi waktu {timeout}d.")
-                            port = runner.port
+                        if runner.status == "ready":
+                            idle_time = current_time - runner.last_used_time
+                            if idle_time > timeout:
+                                logger.info(
+                                    f"Model '{alias}' idle selama {idle_time:.0f}s (>{timeout}s). Stopping..."
+                                )
+                                runners_to_stop.append((alias, runner.port))
+
+                # Stop runners di luar lock untuk menghindari deadlock
+                for alias, port in runners_to_stop:
+                    async with self.lock:
+                        runner = self.active_runners.get(alias)
+                        if runner and runner.port == port:  # Pastikan masih runner yang sama
                             await runner.stop()
                             self._release_port(port)
-                            runners_to_stop.append(alias)
+                            del self.active_runners[alias]
 
-                if runners_to_stop:
-                    async with self.lock:
-                        for alias in runners_to_stop:
-                            if alias in self.active_runners:
-                                del self.active_runners[alias]
+                            # Juga hapus dari VRAM tracker
+                            await self.vram_tracker.track_model_eject(alias)
+
         except asyncio.CancelledError:
             logger.info("Idle check watchdog cancelled")
             raise
@@ -326,9 +495,7 @@ class ModelManager:
             failed_info = self.failed_models[model_alias]
             if failed_info["attempts"] >= 3:  # Max global attempts
                 raise RuntimeError(
-                    f"Model '{model_alias}' has failed {failed_info['attempts']} times. "
-                    f"Last error: {failed_info['error']}... "
-                    f"Fix configuration before retrying."
+                    f"Model '{model_alias}' has failed {failed_info['attempts']} times. Last error: {failed_info['error']}..."
                 )
 
         # Menyimpan runner
@@ -360,6 +527,9 @@ class ModelManager:
                     runner = None  # Set ke None agar memicu Cold Start
 
                 elif runner.status == "loading" or runner.status == "starting":
+                    # PENTING: Update last_used_time meski sedang loading
+                    # Ini mencegah idle watchdog menghentikan model saat loading
+                    runner.last_used_time = time.time()
                     logger.info(
                         f"[{model_alias}] Request diterima saat status '{runner.status}'.")
 
@@ -368,9 +538,24 @@ class ModelManager:
                     return runner
 
             if runner is None:
+                # Get model file size for VRAM estimation
+                model_conf = self.config.models[model_alias]
+                model_path = Path(model_conf.model_path)
+                model_size_mb = model_path.stat().st_size / (1024**2)
+                model_size_gb = model_size_mb / 1024
+
+                # Estimate VRAM needed based on model size
+                vram_multiplier = self.config.system.vram_multiplier
+                estimated_vram_needed_mb = (
+                    model_size_mb * vram_multiplier) + 150
+
+                # Minimum threshold from config
+                min_vram_required = self.config.system.min_vram_required
+                estimated_vram_needed_mb = max(
+                    estimated_vram_needed_mb, min_vram_required)
+
                 logger.info(f"[{model_alias}] sedang bersiap diri.")
                 metrics["models_loaded_total"] += 1  # Track metric
-                model_conf = self.config.models[model_alias]
                 new_port = self._allocate_port()
 
                 runner = RunnerProcess(
@@ -384,6 +569,41 @@ class ModelManager:
                 runner.status = "starting"
                 self.active_runners[model_alias] = runner
 
+                # Init VRAM Tracker to trigger this acquires load_lock and waits for other models
+                await self.vram_tracker.track_model_load_start(model_alias, new_port)
+
+                # Check VRAM after acquiring lock
+                vram_report = self.vram_tracker.get_vram_report()
+                free_vram_mb = vram_report["estimated_free_for_new_model_mb"]
+
+                if free_vram_mb < estimated_vram_needed_mb:
+                    # Not enough VRAM - cleanup and reject
+                    loaded_models = [
+                        alias for alias, r in self.active_runners.items()
+                        if r.is_alive() and r.status == "ready"
+                    ]
+
+                    # Release resources
+                    self._release_port(new_port)
+                    del self.active_runners[model_alias]
+
+                    # Release VRAM tracker lock
+                    await self.vram_tracker.track_model_load_failed(
+                        model_alias,
+                        f"Insufficient VRAM: need {estimated_vram_needed_mb:.0f} MB, have {free_vram_mb:.0f} MB"
+                    )
+
+                    raise InsufficientVRAMError(
+                        model_alias=model_alias,
+                        required_mb=estimated_vram_needed_mb,
+                        available_mb=free_vram_mb,
+                        loaded_models=loaded_models
+                    )
+
+                logger.info(
+                    f"[{model_alias}] VRAM check passed"
+                )
+
         # Retry logic with proper error handling
         max_retries = runner.max_retries
 
@@ -392,6 +612,12 @@ class ModelManager:
             if self.shutdown_event.is_set():
                 logger.warning(
                     f"[{model_alias}] Aborting start due to shutdown")
+
+                # Jika shutdown maka panggil fungsi track_model_load_failed, tapi msgnya mengarah ke shutdown
+                await self.vram_tracker.track_model_load_failed(
+                    model_alias, "Server is shutting down"
+                )
+
                 async with self.lock:
                     if model_alias in self.active_runners:
                         port = runner.port
@@ -410,19 +636,20 @@ class ModelManager:
                 if model_alias in self.failed_models:
                     del self.failed_models[model_alias]
 
+                # nek iso, panggil func track.model.load_complete
+                await self.vram_tracker.track_model_load_complete(model_alias)
+
                 return runner
 
             except Exception as e:
                 error_msg = str(e)
                 logger.error(
                     f"[{model_alias}] Start attempt {attempt + 1}/{max_retries + 1} failed: {error_msg}")
-                logger.error(f"Gagal total men-start {model_alias}: {e}")
 
                 # Is error retriable?
                 if not self._is_retriable_error(error_msg):
                     logger.error(
-                        f"[{model_alias}] Permanent error detected. No retry. "
-                        f"Error: {error_msg}"
+                        f"[{model_alias}] Permanent error detected. No retry. | Error: {error_msg}"
                     )
 
                     # Track failed model
@@ -430,6 +657,9 @@ class ModelManager:
                         "error": error_msg,
                         "attempts": attempt + 1
                     }
+
+                    # Malaz bikin komentar jir, intinya jika error / failed, panggil fungsi yang failed
+                    await self.vram_tracker.track_model_load_failed(model_alias, error_msg)
 
                     # Cleanup
                     async with self.lock:
@@ -439,9 +669,7 @@ class ModelManager:
                             del self.active_runners[model_alias]
 
                     raise RuntimeError(
-                        f"Model '{model_alias}' failed to start due to configuration error. "
-                        f"Error: {error_msg} "
-                        f"Please check config and llama-server arguments."
+                        f"Model '{model_alias}' failed to start due to configuration error | Error: {error_msg} "
                     )
 
                 # Last attempt failed
@@ -463,8 +691,7 @@ class ModelManager:
                             del self.active_runners[model_alias]
 
                     raise RuntimeError(
-                        f"Model '{model_alias}' failed after {max_retries + 1} attempts. "
-                        f"Last error: {error_msg}"
+                        f"Model '{model_alias}' failed after {max_retries + 1} attempts. | Last error: {error_msg}"
                     )
 
                 # Retry logic
@@ -476,6 +703,11 @@ class ModelManager:
                     if self.shutdown_event.is_set():
                         logger.warning(
                             f"[{model_alias}] Aborting retry due to shutdown")
+
+                        await self.vram_tracker.track_model_load_failed(
+                            model_alias, "Server shutting down during retry"
+                        )
+
                         async with self.lock:
                             if model_alias in self.active_runners:
                                 port = runner.port
@@ -502,6 +734,9 @@ class ModelManager:
                 del self.active_runners[model_alias]
                 metrics["models_ejected_total"] += 1  # Track metric
 
+                # Notify VRAM Tracker tentang eject
+                await self.vram_tracker.track_model_eject(model_alias)
+
                 logger.info(
                     f"[{model_alias}] Berhasil di-eject. Port {port} dikembalikan ke pool.")
                 return True
@@ -512,9 +747,27 @@ class ModelManager:
 
     async def stop_all_runners(self):
         logger.info("Mematikan semua runner yang aktif.")
+
+        # Stop VRAM monitoring first
+        await self.vram_tracker.stop_monitoring()
+
         async with self.lock:
-            for runner in self.active_runners.values():
+            if not self.active_runners:
+                logger.info("No active runners to stop.")
+                return
+
+            # Log all models yang akan di-stop
+            model_list = list(self.active_runners.keys())
+            logger.info(f"Stopping {len(model_list)} models: {model_list}")
+
+            # Stop each runner with logging
+            for alias, runner in self.active_runners.items():
+                logger.info(f"Stopping runner: {alias}")
                 await runner.stop()
+                logger.info(f"Runner stopped: {alias}")
+
+        # Shutdown VRAM tracker
+        self.vram_tracker.shutdown()
         logger.info("Semua runner dimatikan.")
 
     def _is_retriable_error(self, error_msg: str) -> bool:

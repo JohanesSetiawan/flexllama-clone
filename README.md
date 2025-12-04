@@ -191,6 +191,56 @@ curl http://localhost:8000/v1/chat/completions \
     - Body: `{"model": "model_alias"}`
 - **`POST /v1/models/{model_alias}/reset`**: Reset the failure state for a model, allowing it to be reloaded.
 
+### Realtime Model Status (NEW)
+
+Endpoints untuk monitoring status model secara realtime, cocok untuk dashboard frontend.
+
+- **`GET /v1/models/status`**: Get status semua model secara lengkap.
+    - Returns: `{ server: {...}, models: {...}, summary: {...} }`
+    - Status yang mungkin: `off`, `starting`, `loading`, `ready`, `loaded`, `stopping`, `crashed`, `failed`
+
+- **`GET /v1/models/status/{model_alias}`**: Get status untuk satu model spesifik.
+
+- **`GET /v1/models/status/stream`**: **SSE (Server-Sent Events) endpoint** untuk realtime updates.
+    - Event types: `full_status`, `model_update`, `server_update`, `heartbeat`
+    - Contoh penggunaan di frontend:
+    ```javascript
+    const eventSource = new EventSource('/v1/models/status/stream');
+    
+    eventSource.addEventListener('full_status', (e) => {
+        const data = JSON.parse(e.data);
+        console.log('Initial status:', data);
+    });
+    
+    eventSource.addEventListener('model_update', (e) => {
+        const data = JSON.parse(e.data);
+        console.log('Model updated:', data.alias, data.status);
+    });
+    
+    eventSource.addEventListener('heartbeat', (e) => {
+        console.log('Connection alive');
+    });
+    ```
+
+- **`GET /v1/models/status/file`**: Get status dari file (fallback untuk pre-startup).
+    - File `model_status.json` di-update setiap ada perubahan status.
+    - Bisa digunakan untuk polling jika SSE belum tersedia.
+
+#### Standalone Status Server (Optional)
+
+Untuk kasus dimana perlu akses status sebelum FastAPI fully ready, tersedia lightweight status server terpisah:
+
+```bash
+# Jalankan di port 8001 (paralel dengan main server)
+python -m app.core.status_server --port 8001
+```
+
+Endpoints pada status server:
+- `GET /health` - Health check
+- `GET /status` - Get all status
+- `GET /status/{alias}` - Get model status
+- `GET /status/stream` - SSE stream
+
 ## Project Structure
 
 ```

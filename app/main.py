@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import uuid
 import httpx
@@ -6,7 +7,8 @@ import pynvml
 import logging
 import asyncio
 import statistics
-from typing import Any, Dict
+from datetime import datetime
+from typing import Any, Dict, Optional
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -19,9 +21,12 @@ from .core.manager import ModelManager
 from .core.warmup import ModelWarmupManager
 from .core.logging_server import setup_logging
 from .core.health_monitor import HealthMonitor
+from .core.errors import InsufficientVRAMError
 from .core.limit_request import RequestSizeLimitMiddleware
 from .core.telemetry import TelemetryCollector, RequestMetrics
+from .core.model_status import ModelStatus, init_status_tracker
 from .core.queue import QueueManager, QueuedRequest, RequestPriority, ModelRequestQueue
+
 
 # Get absolute path to config.json
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -71,25 +76,38 @@ telemetry = None
 http_client = None
 gpu_handle = None
 health_monitor = None
+status_tracker = None
 
 
 @app.on_event("startup")
 async def app_startup():
-    """Startup tasks - Initialize semua dependencies."""
-    global config, manager, warmup_manager, queue_manager, telemetry, http_client, gpu_handle, health_monitor
+    global config, manager, warmup_manager, queue_manager, telemetry, http_client, gpu_handle, health_monitor, status_tracker
 
     try:
+        logger.info("Initializing ModelStatusTracker.")
+        status_tracker = init_status_tracker()
+        await status_tracker.set_server_status("initializing")
+
         logger.info(f"Loading config from: {CONFIG_PATH}")
         config = load_config(CONFIG_PATH)
+        await status_tracker.initialize_from_config(list(config.models.keys()))
 
         logger.info("Initializing HTTP client.")
+        limits = httpx.Limits(
+            max_keepalive_connections=100,
+            max_connections=200,
+            keepalive_expiry=60.0
+        )
+
         http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=10.0,
-                read=config.system.request_timeout_sec,
+                read=config.system.request_timeout_sec * 2,
                 write=10.0,
                 pool=5.0
-            )
+            ),
+            limits=limits,
+            http2=True
         )
 
         logger.info("Initializing ModelManager.")
@@ -119,6 +137,12 @@ async def app_startup():
         logger.info("Starting health monitoring.")
         health_monitor.start()
 
+        logger.info("Starting model status sync task.")
+        status_sync_task = asyncio.create_task(_sync_model_statuses())
+        background_tasks.append(status_sync_task)
+
+        await status_tracker.set_server_status("ready")
+
         logger.info("Server startup complete!")
 
     except Exception as e:
@@ -134,6 +158,10 @@ async def app_startup():
 async def app_shutdown():
     """Graceful shutdown dengan proper cleanup."""
     logger.info("Application shutdown initiated.")
+
+    # Update status tracker
+    if status_tracker:
+        await status_tracker.set_server_status("shutting_down")
 
     # Set shutdown flag
     shutdown_event.set()
@@ -222,6 +250,110 @@ active_requests_lock = asyncio.Lock()
 
 # Track background tasks yang perlu di-cancel
 background_tasks = []
+
+
+async def _sync_model_statuses():
+    """
+    Background task untuk sync status model dari manager ke status tracker.
+
+    Ini berjalan secara periodik untuk:
+    1. Detect perubahan status runner
+    2. Update VRAM usage per model
+    3. Detect crashed/stopped runners
+    """
+    sync_interval = 2  # seconds
+
+    logger.info("Model status sync task started")
+
+    try:
+        while not shutdown_event.is_set():
+            try:
+                # Wait dengan shutdown check
+                try:
+                    await asyncio.wait_for(
+                        shutdown_event.wait(),
+                        timeout=sync_interval
+                    )
+                    # Shutdown triggered
+                    break
+                except asyncio.TimeoutError:
+                    pass  # Normal timeout, continue sync
+
+                # Skip jika manager belum ready
+                if manager is None or status_tracker is None:
+                    continue
+
+                # Sync setiap model
+                async with manager.lock:
+                    # Get all models from config
+                    all_models = set(config.models.keys()) if config else set()
+                    active_models = set(manager.active_runners.keys())
+
+                    # Update status untuk active models
+                    for alias, runner in manager.active_runners.items():
+                        # Map runner status ke ModelStatus
+                        runner_status = runner.status
+
+                        if runner_status == "ready":
+                            model_status = ModelStatus.READY
+                        elif runner_status == "loading":
+                            model_status = ModelStatus.LOADING
+                        elif runner_status == "starting":
+                            model_status = ModelStatus.STARTING
+                        elif runner_status == "crashed":
+                            model_status = ModelStatus.CRASHED
+                        elif runner_status == "stopped":
+                            model_status = ModelStatus.OFF
+                        else:
+                            model_status = ModelStatus.UNKNOWN
+
+                        # Get VRAM usage jika ada
+                        vram_mb = None
+                        if alias in manager.vram_tracker.model_tracks:
+                            track = manager.vram_tracker.model_tracks[alias]
+                            vram_mb = track.current_vram_used_mb
+
+                        # Update status tracker
+                        await status_tracker.update_status(
+                            alias=alias,
+                            status=model_status,
+                            port=runner.port if runner.is_alive() else None,
+                            error_message=runner.startup_error if runner_status == "crashed" else None,
+                            vram_used_mb=vram_mb
+                        )
+
+                    # Update models yang tidak active ke OFF
+                    for alias in all_models - active_models:
+                        # Check jika ada di failed_models
+                        if alias in manager.failed_models:
+                            failed_info = manager.failed_models[alias]
+                            await status_tracker.update_status(
+                                alias=alias,
+                                status=ModelStatus.FAILED,
+                                error_message=failed_info.get(
+                                    "error", "Unknown error")
+                            )
+                        else:
+                            # Model tidak aktif
+                            current_status = await status_tracker.get_status(alias)
+                            if current_status and current_status.status not in [ModelStatus.OFF, ModelStatus.FAILED]:
+                                await status_tracker.update_status(
+                                    alias=alias,
+                                    status=ModelStatus.OFF
+                                )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in status sync: {e}")
+                await asyncio.sleep(5)  # Wait longer on error
+
+    except asyncio.CancelledError:
+        logger.info("Model status sync task cancelled")
+    except Exception as e:
+        logger.exception(f"Fatal error in status sync task: {e}")
+    finally:
+        logger.info("Model status sync task stopped")
 
 
 # --- Custom fungsi ---
@@ -342,70 +474,113 @@ async def _process_queued_request(
     runner,
     endpoint: str
 ) -> Dict[str, Any]:
-    """Process single queued request."""
+    """Process single queued request with retry logic."""
     body = queued_req_data["body"]
     request_id = queued_req_data["request_id"]
+    model_alias = queued_req_data["model_alias"]
+
+    start_time = time.time()
+    max_retries = 2
+    retry_delay = 1.0
 
     logger.debug(
-        f"[Queue] Processing request {request_id} for {queued_req_data['model_alias']}")
+        f"[Queue] Processing request {request_id} for {model_alias}")
 
-    try:
-        # Build request
-        internal_url = f"{runner.url}{endpoint}"
-        req = http_client.build_request(
-            method="POST",
-            url=internal_url,
-            json=body,
-            headers={"Content-Type": "application/json"}
-        )
+    for attempt in range(max_retries + 1):
+        try:
+            # Build request
+            internal_url = f"{runner.url}{endpoint}"
+            req = http_client.build_request(
+                method="POST",
+                url=internal_url,
+                json=body,
+                headers={"Content-Type": "application/json"}
+            )
 
-        # Send request
-        response_stream = await http_client.send(req, stream=True)
+            build_time = time.time() - start_time
 
-        # Check if streaming
-        is_streaming = body.get("stream", False)
+            # Send request
+            send_start = time.time()
+            response_stream = await http_client.send(req, stream=True)
+            send_time = time.time() - send_start
 
-        if is_streaming:
-            # For streaming, collect all chunks
-            chunks = []
-            async for chunk in response_stream.aiter_bytes():
-                chunks.append(chunk)
-            await response_stream.aclose()
+            # Check if streaming
+            is_streaming = body.get("stream", False)
 
-            # Return raw chunks for client streaming
-            return {
-                "type": "stream",
-                "chunks": chunks,
-                "status_code": response_stream.status_code
-            }
-        else:
-            # Non-streaming: read full response
-            content = await response_stream.aread()
-            await response_stream.aclose()
+            if is_streaming:
+                # For streaming, collect all chunks
+                chunks = []
+                async for chunk in response_stream.aiter_bytes():
+                    chunks.append(chunk)
+                await response_stream.aclose()
 
-            # Parse response
-            import json
-            response_data = json.loads(content.decode('utf-8'))
+                total_time = time.time() - start_time
+                logger.debug(
+                    f"[Queue] Request {request_id} timing: build={build_time:.3f}s, "
+                    f"send={send_time:.3f}s, total={total_time:.3f}s (streaming)"
+                )
 
-            # Extract tokens
-            tokens = 0
-            if 'usage' in response_data:
-                tokens = response_data['usage'].get('completion_tokens', 0)
-            elif 'choices' in response_data and response_data['choices']:
-                content_text = response_data['choices'][0].get(
-                    'message', {}).get('content', '')
-                tokens = len(content_text) // 4
+                # Return raw chunks for client streaming
+                return {
+                    "type": "stream",
+                    "chunks": chunks,
+                    "status_code": response_stream.status_code
+                }
+            else:
+                # Non-streaming: read full response
+                read_start = time.time()
+                content = await response_stream.aread()
+                read_time = time.time() - read_start
+                await response_stream.aclose()
 
-            return {
-                "type": "json",
-                "data": response_data,
-                "tokens": tokens,
-                "status_code": response_stream.status_code
-            }
+                # Parse response
+                response_data = json.loads(content.decode('utf-8'))
 
-    except Exception as e:
-        logger.exception(f"[Queue] Error processing request {request_id}: {e}")
-        raise
+                # Extract tokens
+                tokens = 0
+                if 'usage' in response_data:
+                    tokens = response_data['usage'].get('completion_tokens', 0)
+                elif 'choices' in response_data and response_data['choices']:
+                    content_text = response_data['choices'][0].get(
+                        'message', {}).get('content', '')
+                    tokens = len(content_text) // 4
+
+                total_time = time.time() - start_time
+                logger.info(
+                    f"[Queue] Request {request_id} timing: build={build_time:.3f}s, "
+                    f"send={send_time:.3f}s, read={read_time:.3f}s, total={total_time:.3f}s"
+                )
+
+                return {
+                    "type": "json",
+                    "data": response_data,
+                    "tokens": tokens,
+                    "status_code": response_stream.status_code
+                }
+
+        except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            # Retriable errors
+            if attempt < max_retries:
+                logger.warning(
+                    f"[Queue] Request {request_id} attempt {attempt + 1}/{max_retries + 1} "
+                    f"failed with {type(e).__name__}: {e}. Retrying in {retry_delay}s..."
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+                continue
+            else:
+                logger.error(
+                    f"[Queue] Request {request_id} failed after {max_retries + 1} attempts: {e}"
+                )
+                raise
+        except Exception as e:
+            logger.exception(
+                f"[Queue] Error processing request {request_id}: {e}")
+            raise
+
+    # Should never reach here
+    raise RuntimeError(
+        f"Unexpected end of retry loop for request {request_id}")
 
 
 async def _process_request_via_queue(
@@ -414,29 +589,31 @@ async def _process_request_via_queue(
     model_alias: str,
     body: Dict[str, Any],
     priority: RequestPriority,
-    endpoint: str
+    endpoint: str,
+    timeout: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Process request via queue system.
 
     This function:
-    1. Ensures runner is available
-    2. Enqueues request
-    3. Waits for queue processor to handle it
-    4. Returns result
+    1. Enqueues request
+    2. Waits for queue processor to handle it
+    3. Returns result
+
+    Note: Runner is obtained by the queue processor, not here,
+    to avoid double runner acquisition.
     """
 
-    # Ensure runner is started (cold start if needed)
-    runner = await manager.get_runner_for_request(model_alias)
+    # Use provided timeout or default from config with multiplier
+    if timeout is None:
+        timeout = config.system.queue_timeout_sec * 3
+
+    enqueue_start = time.time()
 
     # Create future for this request
     response_future = asyncio.Future()
 
-    # Start queue processor if not running
-    if not queue.processing:
-        asyncio.create_task(_queue_processor(model_alias, queue, endpoint))
-
-    # Enqueue request
+    # Enqueue request first
     queued_req = QueuedRequest(
         priority=priority.value,
         timestamp=time.time(),
@@ -451,7 +628,6 @@ async def _process_request_via_queue(
             queue.total_rejected += 1
             raise RuntimeError(
                 f"Queue for model '{model_alias}' is full ({queue.max_queue_size}). "
-                f"Try again later."
             )
 
         # Insert with priority
@@ -466,14 +642,26 @@ async def _process_request_via_queue(
             queue.queue.append(queued_req)
 
         queue.total_requests += 1
+
+        # Signal that queue has items
         queue.queue_not_empty.set()
 
+        # Start queue processor if not running
+        should_start_processor = not queue.processing
+
+    # Start processor outside the lock to avoid deadlock
+    if should_start_processor:
+        asyncio.create_task(_queue_processor(model_alias, queue, endpoint))
+
     # Wait for result with timeout
-    timeout = config.system.queue_timeout_sec
     try:
         result = await asyncio.wait_for(response_future, timeout=timeout)
         return result
     except asyncio.TimeoutError:
+        wait_time = time.time() - enqueue_start
+        logger.error(
+            f"[Queue] Request {request_id} timeout after {wait_time:.1f}s (timeout={timeout}s, queue_length={len(queue.queue)})"
+        )
         # Remove from queue if timeout
         async with queue.lock:
             try:
@@ -500,22 +688,26 @@ async def _queue_processor(model_alias: str, queue: ModelRequestQueue, endpoint:
 
     logger.info(f"[Queue] Starting processor for model '{model_alias}'")
 
+    idle_timeout = 120  # Increased to 120 seconds for high-latency workloads
+
     try:
         while True:
-            # Dequeue next request
+            # Try to dequeue immediately first
             queued_req = await queue.dequeue()
 
             if queued_req is None:
-                # Queue empty, wait for signal or timeout
+                # Queue empty, clear the event and wait for signal or timeout
+                queue.queue_not_empty.clear()
+
                 try:
                     await asyncio.wait_for(
                         queue.queue_not_empty.wait(),
-                        timeout=30  # 30 seconds idle timeout
+                        timeout=idle_timeout
                     )
-                    queue.queue_not_empty.clear()
+                    # Don't clear here - let the next iteration handle it
                     continue
                 except asyncio.TimeoutError:
-                    # No requests in 30s, stop processor
+                    # No requests in idle_timeout, stop processor
                     logger.info(
                         f"[Queue] Processor idle for {model_alias}, stopping")
                     break
@@ -526,15 +718,24 @@ async def _queue_processor(model_alias: str, queue: ModelRequestQueue, endpoint:
 
             # Process request
             try:
+                process_start = time.time()
                 logger.info(
                     f"[Queue] Processing request {queued_req.request_id} "
                     f"for {model_alias} (priority: {queued_req.priority})"
                 )
 
                 # Get runner
+                runner_start = time.time()
                 runner = await manager.get_runner_for_request(model_alias)
+                runner_time = time.time() - runner_start
+
+                if runner_time > 0.1:  # Log if getting runner takes more than 100ms
+                    logger.warning(
+                        f"[Queue] Slow runner acquisition for {queued_req.request_id}: {runner_time:.3f}s"
+                    )
 
                 # Process the request
+                request_start = time.time()
                 result = await _process_queued_request(
                     {
                         "body": queued_req.body,
@@ -544,6 +745,7 @@ async def _queue_processor(model_alias: str, queue: ModelRequestQueue, endpoint:
                     runner,
                     endpoint
                 )
+                request_time = time.time() - request_start
 
                 # Set result to future
                 if not queued_req.response_future.done():
@@ -552,8 +754,13 @@ async def _queue_processor(model_alias: str, queue: ModelRequestQueue, endpoint:
                 async with queue.lock:
                     queue.total_processed += 1
 
-                logger.debug(
-                    f"[Queue] Request {queued_req.request_id} completed successfully"
+                total_process_time = time.time() - process_start
+                queue_wait_time = process_start - queued_req.timestamp
+
+                logger.info(
+                    f"[Queue] Request {queued_req.request_id} completed: "
+                    f"queue_wait={queue_wait_time:.3f}s, runner={runner_time:.3f}s, "
+                    f"request={request_time:.3f}s, total={total_process_time:.3f}s"
                 )
 
             except Exception as e:
@@ -602,13 +809,6 @@ async def _proxy_request_with_queue(request: Request, endpoint: str):
                 detail="Field 'model' wajib ada di JSON body."
             )
 
-        # Validate model alias
-        if not model_alias.replace('-', '').replace('_', '').isalnum():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Model alias hanya boleh mengandung alphanumeric, dash, dan underscore."
-            )
-
         # Set model alias for telemetry
         request.state.model_alias = model_alias
 
@@ -643,14 +843,18 @@ async def _proxy_request_with_queue(request: Request, endpoint: str):
         )
 
         try:
-            # Process request through queue
+            # Process request through queue with extended timeout
+            # Use 3x config timeout for high-latency workloads
+            queue_timeout = config.system.queue_timeout_sec * 3
+
             result = await _process_request_via_queue(
                 queue=queue,
                 request_id=request_id,
                 model_alias=model_alias,
                 body=body,
                 priority=priority,
-                endpoint=endpoint
+                endpoint=endpoint,
+                timeout=queue_timeout
             )
 
             # Record queue time
@@ -683,14 +887,41 @@ async def _proxy_request_with_queue(request: Request, endpoint: str):
                 )
 
         except TimeoutError as e:
-            logger.error(f"[Queue] Request {request_id} timeout: {e}")
+            queue_wait_time = time.time() - queue_start_time
+            logger.error(
+                f"[Queue] Request {request_id} timeout after {queue_wait_time:.1f}s: {e}"
+            )
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail=f"Request timeout in queue: {str(e)}"
+                detail=f"Request timeout in queue after {queue_wait_time:.1f}s: {str(e)}"
+            )
+        except InsufficientVRAMError as e:
+            # VRAM not enough to load model
+            logger.warning(
+                f"[Queue] Insufficient VRAM for {model_alias}: "
+                f"need {e.required_mb:.0f} MB, have {e.available_mb:.0f} MB"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": {
+                        "message": str(e),
+                        "type": "insufficient_vram_error",
+                        "code": "vram_exhausted",
+                        "model": e.model_alias,
+                        "required_mb": round(e.required_mb),
+                        "available_mb": round(e.available_mb),
+                        "loaded_models": e.loaded_models
+                    }
+                }
             )
         except RuntimeError as e:
-            # Queue full
-            logger.warning(f"[Queue] Queue full for {model_alias}: {e}")
+            # Queue full or other runtime errors
+            error_msg = str(e)
+            if "queue" in error_msg.lower():
+                logger.warning(f"[Queue] Queue full for {model_alias}: {e}")
+            else:
+                logger.warning(f"[Queue] Runtime error for {model_alias}: {e}")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=str(e)
@@ -1016,56 +1247,245 @@ async def get_models_health():
     return health_monitor.get_all_health()
 
 
+# --- Model Status Realtime Endpoints ---
+
+@app.get("/v1/models/status")
+async def get_all_models_status():
+    """
+    Get status semua model secara lengkap.
+
+    Returns:
+        - server: Status server (initializing/ready/shutting_down)
+        - models: Dict semua model dengan statusnya
+        - summary: Ringkasan jumlah model per status
+
+    Status yang mungkin:
+        - off: Model tidak aktif
+        - starting: Subprocess sedang di-spawn
+        - loading: Model sedang di-load ke VRAM
+        - ready/loaded: Model siap menerima request
+        - stopping: Model sedang dihentikan
+        - crashed: Model crash
+        - failed: Model gagal start
+    """
+    if not status_tracker:
+        # Fallback: baca dari file jika tracker belum ready
+        from .core.model_status import ModelStatusTracker
+        file_status = ModelStatusTracker.read_status_file()
+        if file_status:
+            return file_status
+        return {"error": "Status tracker not initialized", "models": {}}
+
+    return await status_tracker.get_full_status()
+
+
+@app.get("/v1/models/status/stream")
+async def stream_models_status(request: Request):
+    """
+    SSE endpoint untuk realtime status updates.
+
+    Event types:
+        - full_status: Status lengkap saat pertama connect
+        - model_update: Update status satu model
+        - server_update: Update status server
+        - heartbeat: Keep-alive setiap 30 detik
+    """
+    if not status_tracker:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"error": "Status tracker not initialized"}
+        )
+
+    async def event_generator():
+        # Subscribe ke updates
+        queue = await status_tracker.subscribe()
+
+        try:
+            # Kirim full status saat pertama connect
+            full_status = await status_tracker.get_full_status()
+            yield f"event: full_status\ndata: {json.dumps(full_status)}\n\n"
+
+            heartbeat_interval = 30  # seconds
+            last_heartbeat = time.time()
+
+            while True:
+                # Check jika client disconnect
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    # Wait for update dengan timeout untuk heartbeat
+                    try:
+                        update = await asyncio.wait_for(
+                            queue.get(),
+                            timeout=heartbeat_interval
+                        )
+
+                        # Send update
+                        event_type = update.get("type", "update")
+                        yield f"event: {event_type}\ndata: {json.dumps(update.get('data', update))}\n\n"
+
+                    except asyncio.TimeoutError:
+                        # Send heartbeat
+                        heartbeat_data = {
+                            "timestamp": datetime.now().isoformat(),
+                            "server_status": status_tracker.server_status
+                        }
+                        yield f"event: heartbeat\ndata: {json.dumps(heartbeat_data)}\n\n"
+                        last_heartbeat = time.time()
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error in SSE stream: {e}")
+                    break
+
+        finally:
+            # Unsubscribe saat disconnect
+            await status_tracker.unsubscribe(queue)
+            logger.debug("SSE client disconnected")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
+
+
 @app.get("/vram")
 def get_vram_status():
     """
-    Memantau VRAM.
-    """
-    global gpu_handle
+    Memantau VRAM secara dinamis dengan tracking per model.
 
+    Returns:
+        - GPU info (total, used, free)
+        - Per-model VRAM usage
+        - Can load more models
+        - Status (healthy/warning/critical)
+    """
     try:
-        # Re-check GPU handle untuk memastikan GPU masih available
-        try:
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
-        except pynvml.NVMLError as e:
-            # Jika GPU error, coba re-init
-            logger.warning(
-                f"GPU error detected: {e}. Trying to re-initialize.")
-            try:
-                pynvml.nvmlShutdown()
-                pynvml.nvmlInit()
-                gpu_handle_new = pynvml.nvmlDeviceGetHandleByIndex(0)
-                gpu_handle = gpu_handle_new
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
-            except Exception as reinit_error:
+        # Get comprehensive VRAM report dari tracker
+        vram_report = manager.vram_tracker.get_vram_report()
+
+        return vram_report
+
+    except Exception as e:
+        logger.exception(f"Error getting VRAM status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Gagal membaca info VRAM: {e}"
+        )
+
+
+@app.get("/vram/models/{model_alias}")
+async def get_model_vram_detail(model_alias: str):
+    """
+    Get detailed VRAM info untuk specific model.
+
+    Args:
+        model_alias: Alias model yang ingin di-check
+
+    Returns:
+        Detailed VRAM usage, snapshots, dan load history
+    """
+    try:
+        async with manager.vram_tracker.lock:
+            if model_alias not in manager.vram_tracker.model_tracks:
                 raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"GPU tidak tersedia: {reinit_error}"
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Model '{model_alias}' tidak ditemukan dalam VRAM tracking."
                 )
 
-        # Runner yang aktif dari manager
-        active_runners_info = {}
-        for alias, runner in manager.active_runners.items():
-            if runner and runner.is_alive():
-                active_runners_info[alias] = {
-                    "port": runner.port,
-                    "status": runner.status
-                }
+            track = manager.vram_tracker.model_tracks[model_alias]
 
-        return {
-            "vram": {
-                "total_gb": f"{mem_info.total / (1024**3):.2f}",
-                "used_gb": f"{mem_info.used / (1024**3):.2f}",
-                "free_gb": f"{mem_info.free / (1024**3):.2f}"
-            },
-            "active_models": active_runners_info
-        }
+            # Get current VRAM info
+            vram_info = manager.vram_tracker.get_current_vram_info()
+
+            # Build detailed response
+            return {
+                "model_alias": model_alias,
+                "port": track.port,
+                "status": track.status,
+                "vram_usage": {
+                    "current_mb": round(track.current_vram_used_mb, 2),
+                    "current_gb": round(track.current_vram_used_mb / 1024, 2),
+                    "average_mb": round(track.get_average_usage_mb(), 2),
+                    "percentage_of_total": round(
+                        (track.current_vram_used_mb /
+                         vram_info["total_mb"]) * 100, 2
+                    ) if vram_info["total_mb"] > 0 else 0
+                },
+                "load_info": {
+                    "start_time": track.load_start_time.isoformat() if track.load_start_time else None,
+                    "end_time": track.load_end_time.isoformat() if track.load_end_time else None,
+                    "duration_sec": track.get_load_duration_sec(),
+                    "initial_free_vram_mb": round(track.initial_vram_free_mb, 2)
+                },
+                "snapshots": [
+                    {
+                        "timestamp": s.timestamp.isoformat(),
+                        "vram_used_mb": round(s.vram_used_mb, 2),
+                        "status": s.status
+                    }
+                    for s in track.snapshots
+                ],
+                "current_gpu_state": {
+                    "total_mb": round(vram_info["total_mb"], 2),
+                    "used_mb": round(vram_info["used_mb"], 2),
+                    "free_mb": round(vram_info["free_mb"], 2)
+                }
+            }
+
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception(f"Error getting VRAM detail for {model_alias}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Gagal membaca info VRAM: {e}")
+            detail=f"Gagal membaca detail VRAM: {e}"
+        )
+
+
+@app.get("/vram/summary")
+def get_vram_summary():
+    """
+    Get ringkasan VRAM yang simpel dan cepat.
+
+    Returns:
+        Ringkasan singkat status VRAM (good untuk monitoring dashboard)
+    """
+    try:
+        vram_report = manager.vram_tracker.get_vram_report()
+
+        return {
+            "status": vram_report["status"],
+            "total_gb": vram_report["gpu_info"]["total_gb"],
+            "used_gb": vram_report["gpu_info"]["used_gb"],
+            "free_gb": vram_report["gpu_info"]["free_gb"],
+            "usage_percentage": vram_report["gpu_info"]["usage_percentage"],
+            "loaded_models": vram_report["loaded_models_count"],
+            "can_load_more": vram_report["can_load_more"],
+            "models": [
+                {
+                    "alias": m["model_alias"],
+                    "vram_gb": m["vram_used_gb"],
+                    "percentage": m.get("vram_percentage", 0)
+                }
+                for m in vram_report["models"]
+                if m["status"] == "loaded"
+            ]
+        }
+
+    except Exception as e:
+        logger.exception(f"Error getting VRAM summary: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Gagal membaca summary VRAM: {e}"
+        )
 
 
 # --- Endpoint OpenAI-Compatible ---

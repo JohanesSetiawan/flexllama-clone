@@ -1,3 +1,4 @@
+import sys
 import json
 import logging
 from pathlib import Path
@@ -44,7 +45,8 @@ def setup_logging(log_level=logging.INFO, use_structured=True):
         )
 
     # Console handler
-    console_handler = logging.StreamHandler()
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
     # File handler - buat directory dulu jika belum ada
@@ -58,3 +60,7 @@ def setup_logging(log_level=logging.INFO, use_structured=True):
     root_logger.setLevel(log_level)
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
+
+    # Suppress httpx di console tapi tetap log ke file
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)

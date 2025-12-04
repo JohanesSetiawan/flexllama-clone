@@ -50,9 +50,11 @@ class ModelRequestQueue:
         request_id: str,
         body: Dict[Any, Any],
         priority: RequestPriority = RequestPriority.NORMAL,
-        timeout: float = 300
+        timeout: float = 600
     ) -> Dict[Any, Any]:
         """Add request to queue and wait for result."""
+
+        enqueue_time = time.time()
 
         async with self.lock:
             # Check queue capacity
@@ -93,13 +95,18 @@ class ModelRequestQueue:
             result = await asyncio.wait_for(response_future, timeout=timeout)
             return result
         except asyncio.TimeoutError:
+            wait_time = time.time() - enqueue_time
+            logger.error(
+                f"[{self.model_alias}] Request {request_id} timeout after {wait_time:.1f}s "
+                f"(queue_length={len(self.queue)}, processing={self.current_processing})"
+            )
             # Remove from queue if timeout
             async with self.lock:
                 try:
                     self.queue.remove(queued_req)
                 except ValueError:
                     pass  # Already processed
-            raise TimeoutError(f"Request timeout after {timeout}s")
+            raise TimeoutError(f"Request timeout after {timeout}s in queue")
 
     async def dequeue(self) -> Optional[QueuedRequest]:
         """Get next request from queue."""

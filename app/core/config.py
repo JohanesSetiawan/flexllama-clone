@@ -37,7 +37,31 @@ class SystemConfig(BaseModel):
 
     preload_models: list[str] = Field(
         default=[],
-        description="Model aliases yang di-preload saat startup"
+        description="Model aliases untuk di-preload saat startup. "
+                    "Gunakan ['*'] untuk load semua model, atau "
+                    "['model1', 'model2'] untuk model spesifik."
+    )
+
+    preload_delay_sec: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+        description="Delay (detik) antar preload model untuk menghindari VRAM overflow. "
+                    "Berguna saat preload multiple models."
+    )
+
+    min_vram_required: int = Field(
+        default=500,
+        ge=200,
+        le=750,
+        description="Digunakan untuk membatasi ukuran VRAM pada GPU (dalam MB)"
+    )
+
+    vram_multiplier: float = Field(
+        default=1.1,
+        ge=1.0,
+        le=3.0,
+        description="Multiplier untuk estimasi VRAM yang dibutuhkan saat load model"
     )
 
     keep_warm_models: int = Field(
@@ -75,6 +99,12 @@ class SystemConfig(BaseModel):
         description="Flash Attention mode: 'on', 'off', atau 'auto'"
     )
 
+    @property
+    def calculated_max_queue_size(self) -> int:
+        """Calculate optimal queue size based on timeout and expected latency."""
+        # Assume worst case: 10s per request (conservative)
+        return max(20, int(self.queue_timeout_sec / 10) * 2)
+
     max_queue_size_per_model: int = Field(
         default=100,
         ge=10,
@@ -107,9 +137,13 @@ class SystemConfig(BaseModel):
 
 class ModelParams(BaseModel):
     n_gpu_layers: int = Field(default=99, ge=-1)
-    n_ctx: int = Field(default=4096, ge=4096, le=8192)
+    n_ctx: int = Field(default=4096, ge=512, le=131072)
     n_batch: int = Field(default=8, ge=8, le=512)
-    rope_freq_base: int = Field(default=0, ge=20000, le=0)
+    rope_freq_base: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="RoPE frequency base. None = gunakan default model"
+    )
     embedding: bool = False
     chat_template: Optional[str] = None
 

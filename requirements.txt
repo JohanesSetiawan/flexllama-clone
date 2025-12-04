@@ -3,3 +3,6 @@ httpx
 pydantic
 uvicorn
 pynvml
+aiohttp
+rich
+tabulate

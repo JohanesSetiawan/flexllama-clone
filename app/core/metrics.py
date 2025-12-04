@@ -1,6 +1,3 @@
-"""
-Global metrics storage untuk tracking sistem.
-"""
 from datetime import datetime
 from collections import defaultdict
 

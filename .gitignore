@@ -220,9 +220,12 @@ __marimo__/
 logs/
 *.log
 
-# Timetracker
-.timetracker
+# Bash
+*.sh
 
 # Exludes
+.timetracker
 config.json
 configOriginal.json
+model_status.json
+benchmark_router.py

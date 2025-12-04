@@ -1,7 +1,7 @@
 import time
 import asyncio
 import logging
-from typing import Dict
+from typing import Dict, List, Set
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -19,76 +19,320 @@ class ModelWarmupManager:
         self.request_counts: Dict[str, int] = defaultdict(int)
         self.last_request_time: Dict[str, float] = {}
 
+        # Track models that failed to load due to VRAM
+        # These should not be retried in warm maintenance
+        self.vram_failed_models: Set[str] = set()
+
         # Track loading
         self.preload_task = None
         self.warmup_task = None
 
-        # Check apakah model recently active (ada request dalam 10 menit terakhir).
-        self.recent_activity_window = 600  # 10 minutes
+        # Check apakah model recently active.
+        self.recent_activity_window = 600
 
-    async def preload_models(self):
-        """Preload models yang di-specify di config."""
-        if not self.config.system.preload_models:
-            logger.info("No models configured for preloading")
-            return
+    def _resolve_preload_models(self) -> List[str]:
+        """
+        Resolve preload_models configuration ke list of model aliases.
 
-        logger.info(f"Preloading models: {self.config.system.preload_models}")
+        Supports:
+        - ["*"] : Load semua model yang ada di config
+        - ["model1", "model2", ...] : Load model spesifik
+        - [] : Tidak preload apapun
 
-        for model_alias in self.config.system.preload_models:
-            if self.shutdown_event.is_set():
-                logger.info("Shutdown detected. Stopping preload.")
-                return
+        Returns:
+            List of model aliases to preload
+        """
+        preload_config = self.config.system.preload_models
 
-            if model_alias not in self.config.models:
+        if not preload_config:
+            return []
+
+        # Check for wildcard ["*"]
+        if len(preload_config) == 1 and preload_config[0] == "*":
+            all_models = list(self.config.models.keys())
+            logger.info(
+                f"[Preload] Wildcard '*' detected. Will preload ALL {len(all_models)} models: {all_models}"
+            )
+            return all_models
+
+        # Validate specific model aliases
+        valid_models = []
+        for model_alias in preload_config:
+            if model_alias == "*":
                 logger.warning(
-                    f"Model '{model_alias}' di preload_models tidak ada di config")
+                    "[Preload] Wildcard '*' should be used alone, not mixed with other aliases. Ignoring '*' and using specific aliases."
+                )
                 continue
 
-            try:
-                logger.info(f"Preloading model: {model_alias}")
-
-                runner = await asyncio.wait_for(
-                    self.manager.get_runner_for_request(model_alias),
-                    timeout=120.0
+            if model_alias in self.config.models:
+                valid_models.append(model_alias)
+            else:
+                logger.warning(
+                    f"[Preload] Model '{model_alias}' tidak ada di config. Skipping."
                 )
 
+        return valid_models
+
+    async def _load_single_model(self, model_alias: str, index: int, total: int) -> bool:
+        """
+        Load a single model with detailed logging and error handling.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            logger.info(
+                f"[Preload] [{index}/{total}] Loading model: {model_alias}")
+
+            start_time = time.time()
+
+            # Get runner
+            runner = await asyncio.wait_for(
+                self.manager.get_runner_for_request(model_alias),
+                timeout=180.0  # 3 minutes timeout
+            )
+
+            # Wait for ready status
+            max_wait_ready = 120
+            wait_start = time.time()
+
+            while runner.status not in ["ready", "crashed", "stopped"]:
+                if time.time() - wait_start > max_wait_ready:
+                    logger.warning(
+                        f"[Preload] [{index}/{total}] Model '{model_alias}' stuck at '{runner.status}' "
+                        f"after {max_wait_ready}s"
+                    )
+                    return False
+
+                if self.shutdown_event.is_set():
+                    logger.info(
+                        "[Preload] Shutdown detected while waiting for ready.")
+                    return False
+
+                await asyncio.sleep(1)
+
+            if runner.status == "ready":
+                load_time = time.time() - start_time
+
+                # Get VRAM info
+                vram_after = self.manager.vram_tracker.get_vram_report()
+
                 logger.info(
-                    f"Model '{model_alias}' successfully preloaded at {runner.url}")
-
-            except asyncio.TimeoutError:
+                    f"[Preload] [{index}/{total}] SUCCESS | '{model_alias}' loaded at {runner.url} "
+                    f"(took {load_time:.1f}s) | VRAM: {vram_after['gpu_info']['used_gb']:.2f} GB used, "
+                    f"{vram_after['gpu_info']['free_gb']:.2f} GB free"
+                )
+                return True
+            else:
                 logger.error(
-                    f"Timeout preloading model '{model_alias}' (exceeded 120s)")
-            except asyncio.CancelledError:
-                logger.info(f"Preload cancelled for model '{model_alias}'")
-                raise
-            except Exception as e:
-                logger.error(f"Failed to preload model '{model_alias}': {e}")
+                    f"[Preload] [{index}/{total}] FAILED | Model '{model_alias}' ended with status '{runner.status}'"
+                )
+                return False
 
-    def record_request(self, model_alias: str):
-        """Record bahwa model di-request (untuk popularity tracking)."""
-        self.request_counts[model_alias] += 1
-        self.last_request_time[model_alias] = time.time()
-
-    def get_popular_models(self, top_n: int = 5) -> list[str]:
-        """Get top N most popular models berdasarkan request count."""
-        sorted_models = sorted(
-            self.request_counts.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        return [model for model, count in sorted_models[:top_n]]
-
-    def is_recently_active(self, model_alias: str) -> bool:
-        """
-        Check apakah model recently active (ada request dalam 10 menit terakhir).
-        Ini prevent preload model yang sudah idle timeout.
-        """
-        if model_alias not in self.last_request_time:
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[Preload] [{index}/{total}] TIMEOUT | Model '{model_alias}' exceeded 180s")
+            return False
+        except Exception as e:
+            logger.error(
+                f"[Preload] [{index}/{total}] ERROR | Model '{model_alias}': {e}")
             return False
 
-        time_since_last_request = time.time(
-        ) - self.last_request_time[model_alias]
-        return time_since_last_request < self.recent_activity_window
+    async def preload_models_parallel(self, max_parallel: int = 2):
+        models_to_preload = self._resolve_preload_models()
+
+        if not models_to_preload:
+            logger.info("[Preload] No models configured for preloading")
+            return
+
+        total_models = len(models_to_preload)
+        max_concurrent = self.config.system.max_concurrent_models
+        preload_delay = self.config.system.preload_delay_sec
+
+        logger.info(
+            f"[Preload] Starting preload PARALLEL for {total_models} models: {models_to_preload}"
+        )
+
+        logger.info(
+            f"[Preload] System max_concurrent_models={max_concurrent} | Preload max_parallel={max_parallel} | Preload delay between batches={preload_delay}s"
+        )
+
+        successful_loads = 0
+        failed_loads = 0
+        skipped_loads = 0
+
+        for batch_start in range(0, total_models, max_parallel):
+            if self.shutdown_event.is_set():
+                logger.info("[Preload] Shutdown detected. Stopping preload.")
+                return
+
+            batch_end = min(batch_start + max_parallel, total_models)
+            batch = models_to_preload[batch_start:batch_end]
+
+            logger.info(
+                f"[Preload] Batch {batch_start//max_parallel + 1}: Loading {len(batch)} models in parallel: {batch}"
+            )
+
+            vram_report = self.manager.vram_tracker.get_vram_report()
+            free_vram_mb = vram_report["estimated_free_for_new_model_mb"]
+            min_vram_required = self.config.system.min_vram_required
+
+            if free_vram_mb < min_vram_required:
+                logger.error(
+                    f"[Preload] Free VRAM: {free_vram_mb:.0f} MB (< {min_vram_required} MB required) | [Preload] Successfully loaded: {successful_loads}/{total_models} models"
+                )
+
+                remaining = models_to_preload[batch_start:]
+                skipped_loads = len(remaining)
+
+                # Tandai semua remaining models sebagai VRAM-failed
+                for skipped_model in remaining:
+                    self.vram_failed_models.add(skipped_model)
+
+                logger.warning(
+                    f"[Preload] Skipped models due to insufficient VRAM: {remaining}"
+                )
+
+                # STOP preload completely
+                break
+
+            # Load batch in parallel
+            load_tasks = []
+            for model_alias in batch:
+                task = asyncio.create_task(self._load_single_model(
+                    model_alias, batch_start + batch.index(model_alias) + 1, total_models))
+                load_tasks.append((model_alias, task))
+
+            # Wait for all loads in batch to complete
+            batch_results = await asyncio.gather(*[task for _, task in load_tasks], return_exceptions=True)
+
+            # Process results
+            for (model_alias, _), result in zip(load_tasks, batch_results):
+                if isinstance(result, Exception):
+                    failed_loads += 1
+                    logger.error(
+                        f"[Preload] Failed to load {model_alias}: {result}")
+
+                    # Check if VRAM related
+                    error_str = str(result).lower()
+                    if "vram" in error_str or "insufficient" in error_str:
+                        self.vram_failed_models.add(model_alias)
+                elif result:
+                    successful_loads += 1
+                else:
+                    failed_loads += 1
+
+            # Delay before next batch (except last batch)
+            if batch_end < total_models and preload_delay > 0:
+                logger.info(
+                    f"[Preload] Waiting {preload_delay}s before next batch...")
+
+                for _ in range(preload_delay):
+                    if self.shutdown_event.is_set():
+                        logger.info(
+                            "[Preload] Shutdown detected during delay.")
+                        return
+                    await asyncio.sleep(1)
+
+        # Summary
+        logger.info(
+            f"[Preload] YEAYYYY | Total: {total_models} | Success: {successful_loads} | Failed: {failed_loads} | Skipped: {skipped_loads}"
+        )
+
+        # Log final VRAM report
+        final_vram = self.manager.vram_tracker.get_vram_report()
+        logger.info(
+            f"[Preload] VRAM STATUS | Used: {final_vram['gpu_info']['used_gb']:.2f} GB | Free: {final_vram['gpu_info']['free_gb']:.2f} GB | Status: {final_vram['status']}"
+        )
+
+    async def preload_models_serial(self):
+        models_to_preload = self._resolve_preload_models()
+
+        if not models_to_preload:
+            logger.info("[Preload] No models configured for preloading")
+            return
+
+        total_models = len(models_to_preload)
+        max_concurrent = self.config.system.max_concurrent_models
+        preload_delay = self.config.system.preload_delay_sec
+
+        logger.info(
+            f"[Preload] Starting preload SERIAL for {total_models} models: {models_to_preload}"
+        )
+
+        logger.info(
+            f"[Preload] System max_concurrent_models={max_concurrent} | Preload delay between batches={preload_delay}s"
+        )
+
+        # Warning jika mencoba preload lebih dari max_concurrent_models
+        if total_models > max_concurrent:
+            logger.warning(
+                f"[Preload] Preload count ({total_models}) > max_concurrent_models ({max_concurrent}). "
+            )
+
+        successful_loads = 0
+        failed_loads = 0
+        skipped_loads = 0
+
+        for idx, model_alias in enumerate(models_to_preload, 1):
+            if self.shutdown_event.is_set():
+                logger.info("[Preload] Shutdown detected. Stopping preload.")
+                return
+
+            # Check VRAM
+            vram_report = self.manager.vram_tracker.get_vram_report()
+            free_vram_mb = vram_report["estimated_free_for_new_model_mb"]
+            min_required = self.config.system.min_vram_required
+
+            if free_vram_mb < min_required:
+                logger.error(
+                    f"[Preload] Insufficient VRAM: {free_vram_mb:.0f} MB < {min_required} MB"
+                )
+
+                remaining = models_to_preload[idx-1:]
+                skipped_loads = len(remaining)
+
+                for skipped_model in remaining:
+                    self.vram_failed_models.add(skipped_model)
+
+                logger.warning(f"[Preload] Skipped models: {remaining}")
+                break
+
+            # Log VRAM status
+            logger.info(
+                f"[Preload] [{idx}/{total_models}] Free VRAM: {free_vram_mb:.0f} MB | Loading: {model_alias}"
+            )
+
+            # Load model
+            result = await self._load_single_model(model_alias, idx, total_models)
+
+            if result:
+                successful_loads += 1
+            else:
+                failed_loads += 1
+
+            # Delay before next model (except last)
+            if idx < total_models and preload_delay > 0:
+                logger.info(
+                    f"[Preload] Waiting {preload_delay}s before next model...")
+
+                for _ in range(preload_delay):
+                    if self.shutdown_event.is_set():
+                        logger.info(
+                            "[Preload] Shutdown detected during delay.")
+                        return
+                    await asyncio.sleep(1)
+
+        # Summary
+        logger.info(
+            f"[Preload] YEAYYYY | Total: {total_models} | Success: {successful_loads} | Failed: {failed_loads} | Skipped: {skipped_loads}"
+        )
+
+        # Log final VRAM report
+        final_vram = self.manager.vram_tracker.get_vram_report()
+        logger.info(
+            f"[Preload] VRAM STATUS | Used: {final_vram['gpu_info']['used_gb']:.2f} GB | Free: {final_vram['gpu_info']['free_gb']:.2f} GB | Status: {final_vram['status']}"
+        )
 
     async def maintain_warm_models(self):
         """Background task untuk keep popular models warm."""
@@ -112,18 +356,24 @@ class ModelWarmupManager:
                 if not popular_models:
                     continue
 
-                # Filter hanya model yang recently active
+                # Filter hanya model yang recently active DAN tidak gagal karena VRAM
                 recently_active_models = [
                     model for model in popular_models
-                    if self.is_recently_active(model)
+                    if self.is_recently_active(model) and model not in self.vram_failed_models
                 ]
 
                 if not recently_active_models:
                     logger.debug(
-                        "No recently active models to keep warm. "
-                        f"Popular models {popular_models} are all idle."
+                        f"No recently active models to keep warm. Popular models {popular_models} are all idle or VRAM-failed."
                     )
                     continue
+
+                # Log juga model yang di-skip karena VRAM
+                vram_skipped = [
+                    m for m in popular_models if m in self.vram_failed_models]
+                if vram_skipped:
+                    logger.debug(
+                        f"Skipping VRAM-failed models: {vram_skipped}")
 
                 logger.info(
                     f"Maintaining warm models: {recently_active_models}")
@@ -139,6 +389,7 @@ class ModelWarmupManager:
                             if model_alias in self.manager.active_runners:
                                 runner = self.manager.active_runners[model_alias]
                                 if runner.is_alive():
+
                                     # Update last_used_time untuk prevent idle timeout
                                     runner.last_used_time = time.time()
                                     logger.debug(
@@ -159,8 +410,7 @@ class ModelWarmupManager:
                                             f"Successfully re-preloaded '{model_alias}'")
                                     except asyncio.TimeoutError:
                                         logger.error(
-                                            f"Timeout re-preloading '{model_alias}' (120s). "
-                                            "Skipping for this cycle."
+                                            f"Timeout re-preloading '{model_alias}' (120s). Skipping for this cycle."
                                         )
                                         # Don't retry immediately, wait for next cycle
                                         continue
@@ -183,15 +433,12 @@ class ModelWarmupManager:
                                             f"Successfully preloaded '{model_alias}'")
                                     except asyncio.TimeoutError:
                                         logger.error(
-                                            f"Timeout preloading '{model_alias}' (120s). "
-                                            "Skipping for this cycle."
+                                            f"Timeout preloading '{model_alias}' (120s). Skipping for this cycle."
                                         )
                                         continue
                                 else:
                                     logger.debug(
-                                        f"Skipping preload for '{model_alias}': "
-                                        f"Last request was {time_since_last_request:.0f}s ago "
-                                        f"(exceeds idle timeout of {self.config.system.idle_timeout_sec}s)"
+                                        f"Skipping preload for '{model_alias}' | Last request was {time_since_last_request:.0f}s ago | (exceeds idle timeout of {self.config.system.idle_timeout_sec}s)"
                                     )
 
                     except asyncio.TimeoutError:
@@ -206,6 +453,24 @@ class ModelWarmupManager:
             raise
         except Exception as e:
             logger.exception(f"Error in maintain_warm_models: {e}")
+
+    async def preload_models(self):
+        # Determine if we can use parallel loading
+        max_concurrent = self.config.system.max_concurrent_models
+
+        # Use parallel loading if max_concurrent > 1 and mmap is enabled
+        use_parallel = max_concurrent > 1 and self.config.system.use_mmap
+
+        if use_parallel:
+            # Load up to 2 models in parallel (conservative for VRAM safety)
+            parallel_count = min(2, max_concurrent)
+            logger.info(
+                f"[Preload] Using PARALLEL loading (max {parallel_count} at once)")
+            await self.preload_models_parallel(max_parallel=parallel_count)
+        else:
+            # Fallback to serial loading
+            logger.info("[Preload] Using SERIAL loading")
+            await self.preload_models_serial()
 
     async def start(self):
         """Start warmup manager tasks."""
@@ -231,3 +496,42 @@ class ModelWarmupManager:
                 pass
 
         logger.info("Warmup manager stopped")
+
+    def record_request(self, model_alias: str):
+        """Record bahwa model di-request (untuk popularity tracking)."""
+        self.request_counts[model_alias] += 1
+        self.last_request_time[model_alias] = time.time()
+
+    def clear_vram_failed(self, model_alias: str = None):
+        """
+        Clear VRAM failed status for a model (or all models).
+        Call this when VRAM becomes available (e.g., after model eject).
+        """
+        if model_alias:
+            self.vram_failed_models.discard(model_alias)
+            logger.info(
+                f"[Warmup] Cleared VRAM-failed status for '{model_alias}'")
+        else:
+            self.vram_failed_models.clear()
+            logger.info("[Warmup] Cleared all VRAM-failed statuses")
+
+    def get_popular_models(self, top_n: int = 5) -> list[str]:
+        """Get top N most popular models berdasarkan request count."""
+        sorted_models = sorted(
+            self.request_counts.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        return [model for model, count in sorted_models[:top_n]]
+
+    def is_recently_active(self, model_alias: str) -> bool:
+        """
+        Check apakah model recently active (ada request dalam 10 menit terakhir).
+        Ini prevent preload model yang sudah idle timeout.
+        """
+        if model_alias not in self.last_request_time:
+            return False
+
+        time_since_last_request = time.time(
+        ) - self.last_request_time[model_alias]
+        return time_since_last_request < self.recent_activity_window

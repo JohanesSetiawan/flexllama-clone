@@ -97,3 +97,40 @@ class ServiceUnavailableError(OpenAIError):
             message=message,
             error_type="service_unavailable_error"
         )
+
+
+class InsufficientVRAMError(Exception):
+    """Raised when there's not enough VRAM to load a model."""
+
+    def __init__(
+        self,
+        model_alias: str,
+        required_mb: float,
+        available_mb: float,
+        loaded_models: list = None
+    ):
+        self.model_alias = model_alias
+        self.required_mb = required_mb
+        self.available_mb = available_mb
+        self.loaded_models = loaded_models or []
+
+        message = (
+            f"Insufficient VRAM to load model '{model_alias}'. "
+            f"Required: ~{required_mb:.0f} MB, Available: {available_mb:.0f} MB."
+        )
+        if loaded_models:
+            message += f" Currently loaded: {loaded_models}"
+
+        super().__init__(message)
+
+
+class QueueFullError(Exception):
+    """Raised when the request queue is full."""
+
+    def __init__(self, model_alias: str, queue_size: int, max_size: int):
+        self.model_alias = model_alias
+        self.queue_size = queue_size
+        self.max_size = max_size
+
+        message = f"Queue full for model '{model_alias}' ({queue_size}/{max_size})"
+        super().__init__(message)
