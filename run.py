@@ -414,8 +414,8 @@ if __name__ == "__main__":
         server.stop_event = stop_event
         server.run()
 
-    except FileNotFoundError:
-        print("FATAL: config.json tidak ditemukan.")
+    except FileNotFoundError as e:
+        print(f"{e}")
         sys.exit(1)
     except json.JSONDecodeError as e:
         print(f"FATAL: config.json tidak valid JSON: {e}")
