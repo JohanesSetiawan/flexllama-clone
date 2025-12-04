@@ -1,5 +1,5 @@
 fastapi[standard]
-httpx
+httpx[http2]
 pydantic
 uvicorn
 pynvml
