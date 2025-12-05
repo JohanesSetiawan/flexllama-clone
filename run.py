@@ -21,6 +21,9 @@ def init_status_file(config_data: dict):
     project_root = Path(__file__).parent
     status_file = project_root / "logs" / "model_status.json"
 
+    # Ensure logs directory exists
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+
     # Get model aliases dari config
     model_aliases = list(config_data.get("models", {}).keys())
 
@@ -63,6 +66,9 @@ def run_status_server_thread(host: str, port: int, stop_event: threading.Event):
     try:
         project_root = Path(__file__).parent
         status_file = project_root / "logs" / "model_status.json"
+
+        # Ensure logs directory exists
+        status_file.parent.mkdir(parents=True, exist_ok=True)
 
         async def get_status(request):
             """Get current status from file."""
