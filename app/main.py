@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import httpx
+import heapq
 import pynvml
 import logging
 import asyncio
@@ -26,6 +27,9 @@ from .core.limit_request import RequestSizeLimitMiddleware
 from .core.telemetry import TelemetryCollector, RequestMetrics
 from .core.model_status import ModelStatus, init_status_tracker
 from .core.queue import QueueManager, QueuedRequest, RequestPriority, ModelRequestQueue
+from .core.prometheus_metrics import (
+    init_prometheus_collector, get_prometheus_collector, PrometheusMetricsCollector
+)
 
 
 # Get absolute path to config.json
@@ -77,11 +81,12 @@ http_client = None
 gpu_handle = None
 health_monitor = None
 status_tracker = None
+prometheus_collector = None
 
 
 @app.on_event("startup")
 async def app_startup():
-    global config, manager, warmup_manager, queue_manager, telemetry, http_client, gpu_handle, health_monitor, status_tracker
+    global config, manager, warmup_manager, queue_manager, telemetry, http_client, gpu_handle, health_monitor, status_tracker, prometheus_collector
 
     try:
         logger.info("Initializing ModelStatusTracker.")
@@ -94,20 +99,20 @@ async def app_startup():
 
         logger.info("Initializing HTTP client.")
         limits = httpx.Limits(
-            max_keepalive_connections=100,
-            max_connections=200,
+            max_keepalive_connections=config.system.http_max_keepalive,
+            max_connections=config.system.http_max_connections,
             keepalive_expiry=60.0
         )
 
         http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
-                connect=10.0,
+                connect=2.0,  # Reduced from 10s - local connections are fast
                 read=config.system.request_timeout_sec * 2,
-                write=10.0,
+                write=5.0,  # Reduced from 10s
                 pool=5.0
             ),
             limits=limits,
-            http2=True
+            http2=False  # HTTP/1.1 faster for local llama.cpp connections
         )
 
         logger.info("Initializing ModelManager.")
@@ -130,6 +135,11 @@ async def app_startup():
 
         logger.info("Initializing health monitor.")
         health_monitor = HealthMonitor(manager, check_interval_sec=30)
+
+        logger.info("Initializing Prometheus metrics collector.")
+        prometheus_collector = init_prometheus_collector(
+            gpu_device_index=config.system.gpu_devices[0]
+        )
 
         logger.info("Starting warmup manager.")
         await warmup_manager.start()
@@ -416,7 +426,7 @@ async def metrics_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def telemetry_middleware(request: Request, call_next):
-    """Middleware untuk collect telemetry."""
+    """Middleware untuk collect telemetry dan prometheus metrics."""
     request_id = str(uuid.uuid4())
     start_time = time.time()
 
@@ -424,48 +434,93 @@ async def telemetry_middleware(request: Request, call_next):
     request.state.start_time = start_time
     request.state.tokens_generated = 0
 
+    # Skip monitoring endpoints
+    skip_endpoints = [
+        '/health', '/metrics', '/metrics/stream', '/metrics/report',
+        '/v1/telemetry/summary', '/vram', '/v1/health/models'
+    ]
+
+    if request.url.path in skip_endpoints:
+        return await call_next(request)
+
+    # Get prometheus collector
+    prom_collector = get_prometheus_collector()
+    model_alias = None
+
     try:
         response = await call_next(request)
 
         # Get model_alias dengan fallback
         model_alias = getattr(request.state, 'model_alias', None)
-
-        # Jika tidak ada model_alias dan bukan monitoring endpoint, skip telemetry
         if model_alias is None:
-            # Skip telemetry untuk monitoring endpoints
-            if request.url.path in ['/health', '/metrics', '/v1/telemetry/summary', '/vram', '/v1/health/models']:
-                return response
             model_alias = "unknown"
 
+        end_time = time.time()
+        duration = end_time - start_time
+        tokens = getattr(request.state, 'tokens_generated', 0)
+        queue_time = getattr(request.state, 'queue_time', 0.0)
+
+        # Determine status
+        status = "success" if response.status_code < 400 else "error"
+
+        # Record to existing telemetry
         metrics_data = RequestMetrics(
             request_id=request_id,
             model_alias=model_alias,
             endpoint=request.url.path,
             start_time=start_time,
-            end_time=time.time(),
+            end_time=end_time,
             status_code=response.status_code,
-            queue_time=getattr(request.state, 'queue_time', 0.0),
+            queue_time=queue_time,
             processing_time=getattr(request.state, 'processing_time', 0.0),
-            tokens_generated=getattr(request.state, 'tokens_generated', 0)
+            tokens_generated=tokens
         )
-
         await telemetry.record_request(metrics_data)
-        response.headers["X-Request-ID"] = request_id
 
+        # Record to prometheus collector
+        if prom_collector and model_alias != "unknown":
+            await prom_collector.record_request_end(
+                model=model_alias,
+                endpoint=request.url.path,
+                duration_seconds=duration,
+                status=status,
+                tokens=tokens,
+                queue_wait_seconds=queue_time,
+                status_code=response.status_code
+            )
+
+        response.headers["X-Request-ID"] = request_id
         return response
 
     except Exception as e:
         # Handle error cases
         model_alias = getattr(request.state, 'model_alias', 'unknown')
+        end_time = time.time()
+        duration = end_time - start_time
+
+        # Record to existing telemetry
         metrics_data = RequestMetrics(
             request_id=request_id,
             model_alias=model_alias,
             endpoint=request.url.path,
             start_time=start_time,
-            end_time=time.time(),
+            end_time=end_time,
             error=str(e)
         )
         await telemetry.record_request(metrics_data)
+
+        # Record to prometheus collector
+        if prom_collector and model_alias != "unknown":
+            await prom_collector.record_request_end(
+                model=model_alias,
+                endpoint=request.url.path,
+                duration_seconds=duration,
+                status="error",
+                tokens=0,
+                queue_wait_seconds=0,
+                status_code=500
+            )
+
         raise
 
 
@@ -649,22 +704,23 @@ async def _process_request_via_queue(
     async with queue.lock:
         if len(queue.queue) >= queue.max_queue_size:
             queue.total_rejected += 1
+            # Track queue rejection to Prometheus
+            prom_collector = get_prometheus_collector()
+            if prom_collector:
+                prom_collector.record_queue_rejected(model_alias)
             raise RuntimeError(
                 f"Queue for model '{model_alias}' is full ({queue.max_queue_size}). "
             )
 
-        # Insert with priority
-        inserted = False
-        for i, existing_req in enumerate(queue.queue):
-            if queued_req.sort_key < existing_req.sort_key:
-                queue.queue.insert(i, queued_req)
-                inserted = True
-                break
-
-        if not inserted:
-            queue.queue.append(queued_req)
+        # Use heapq for O(log n) insertion instead of O(n) manual insertion
+        heapq.heappush(queue.queue, queued_req)
 
         queue.total_requests += 1
+
+        # Update queue depth in Prometheus
+        prom_collector = get_prometheus_collector()
+        if prom_collector:
+            prom_collector.update_queue_depth(model_alias, len(queue.queue))
 
         # Signal that queue has items
         queue.queue_not_empty.set()
@@ -713,7 +769,7 @@ async def _queue_processor(model_alias: str, queue: ModelRequestQueue, endpoint:
 
     logger.info(f"[Queue] Starting processor for model '{model_alias}'")
 
-    idle_timeout = 120  # Increased to 120 seconds for high-latency workloads
+    idle_timeout = config.system.queue_processor_idle_sec  # Configurable timeout
 
     try:
         while True:
@@ -1230,9 +1286,9 @@ def health_check():
             detail=f"Health check gagal: {e}")
 
 
-@app.get("/metrics")
-async def get_metrics():
-    """Endpoint untuk metrics (Prometheus-compatible text format)."""
+@app.get("/metrics/legacy")
+async def get_metrics_legacy():
+    """Legacy metrics endpoint (old format). Use /metrics for Prometheus format."""
     output = []
 
     # Request metrics
@@ -1283,7 +1339,151 @@ async def get_models_health():
     return health_monitor.get_all_health()
 
 
+# --- Prometheus Metrics Endpoints ---
+
+@app.get("/metrics")
+async def get_prometheus_metrics():
+    """
+    Prometheus exposition format metrics endpoint.
+
+    This endpoint is designed to be scraped by Prometheus server.
+    Returns all metrics in Prometheus text format.
+
+    Usage:
+        - Configure Prometheus to scrape this endpoint
+        - Default scrape interval: 15s
+    """
+    collector = get_prometheus_collector()
+    if not collector:
+        return Response(
+            content="# Prometheus collector not initialized\n",
+            media_type="text/plain",
+            status_code=503
+        )
+
+    content = collector.get_prometheus_metrics()
+    return Response(
+        content=content,
+        media_type=collector.get_content_type()
+    )
+
+
+@app.get("/metrics/stream")
+async def stream_metrics(request: Request):
+    """
+    Server-Sent Events (SSE) endpoint for real-time metrics streaming.
+
+    Streams metrics updates every 2 seconds with per-model breakdown.
+
+    Event types:
+        - metrics: Real-time metrics snapshot
+        - heartbeat: Keep-alive every 30 seconds
+
+    Usage:
+        curl -N http://localhost:8000/metrics/stream
+    """
+    collector = get_prometheus_collector()
+    if not collector:
+        return JSONResponse(
+            {"error": "Prometheus collector not initialized"},
+            status_code=503
+        )
+
+    async def event_generator():
+        heartbeat_interval = 30
+        metrics_interval = 2
+        last_heartbeat = time.time()
+
+        try:
+            while True:
+                # Check for client disconnect
+                if await request.is_disconnected():
+                    break
+
+                # Check shutdown
+                if shutdown_event.is_set():
+                    yield f"event: shutdown\ndata: {{\"message\": \"Server shutting down\"}}\n\n"
+                    break
+
+                # Send metrics
+                try:
+                    snapshot = await collector.get_realtime_snapshot(
+                        manager=manager,
+                        queue_manager=queue_manager
+                    )
+                    yield f"event: metrics\ndata: {json.dumps(snapshot)}\n\n"
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.warning(
+                        f"Error generating metrics snapshot: {error_msg}")
+                    # Send error event so client knows what happened
+                    yield f"event: error\ndata: {{\"error\": \"{error_msg}\"}}\n\n"
+
+                # Send heartbeat if needed (only after 30 seconds)
+                current_time = time.time()
+                if current_time - last_heartbeat >= heartbeat_interval:
+                    yield f"event: heartbeat\ndata: {{\"timestamp\": \"{datetime.now().isoformat()}\"}}\n\n"
+                    last_heartbeat = current_time
+
+                await asyncio.sleep(metrics_interval)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in metrics stream: {e}")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@app.get("/metrics/report")
+async def get_metrics_report():
+    """
+    Get detailed 5-minute aggregated metrics report.
+
+    Returns comprehensive metrics including:
+        - Server status and uptime
+        - GPU VRAM usage (MB and GB)
+        - Per-model detailed breakdown:
+            - Request counts (total, success, errors)
+            - Latency statistics (avg, min, max, p95)
+            - Queue statistics
+            - Token throughput
+        - Aggregated totals
+
+    Usage:
+        curl http://localhost:8000/metrics/report
+    """
+    collector = get_prometheus_collector()
+    if not collector:
+        return JSONResponse(
+            {"error": "Prometheus collector not initialized"},
+            status_code=503
+        )
+
+    try:
+        report = await collector.get_5min_report(
+            manager=manager,
+            queue_manager=queue_manager
+        )
+        return report
+    except Exception as e:
+        logger.error(f"Error generating metrics report: {e}")
+        return JSONResponse(
+            {"error": f"Failed to generate report: {str(e)}"},
+            status_code=500
+        )
+
+
 # --- Model Status Realtime Endpoints ---
+
 
 @app.get("/v1/models/status")
 async def get_all_models_status():

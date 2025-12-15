@@ -1,9 +1,9 @@
 import time
+import heapq
 import asyncio
 import logging
 from enum import Enum
-from collections import deque
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -17,6 +17,11 @@ class RequestPriority(Enum):
 
 @dataclass(order=True)
 class QueuedRequest:
+    """Request in queue with priority ordering.
+
+    Uses (priority, timestamp) as sort key for heap operations.
+    Lower priority value = higher priority (HIGH=1 > NORMAL=2 > LOW=3).
+    """
     priority: int
     timestamp: float
     request_id: str = field(compare=False)
@@ -29,12 +34,17 @@ class QueuedRequest:
 
 
 class ModelRequestQueue:
-    """Queue per model dengan priority dan backpressure."""
+    """Queue per model dengan priority heap dan backpressure.
+
+    Optimized with heapq for O(log n) insertion instead of O(n) deque insertion.
+    """
 
     def __init__(self, model_alias: str, max_queue_size: int = 100):
         self.model_alias = model_alias
         self.max_queue_size = max_queue_size
-        self.queue: deque[QueuedRequest] = deque()
+
+        # Use list for heapq operations - O(log n) insert vs O(n) deque insert
+        self._heap: List[QueuedRequest] = []
         self.processing = False
         self.lock = asyncio.Lock()
         self.queue_not_empty = asyncio.Event()
@@ -43,7 +53,12 @@ class ModelRequestQueue:
         self.total_requests = 0
         self.total_processed = 0
         self.total_rejected = 0
-        self.current_processing = 0  # Track concurrent processing
+        self.current_processing = 0
+
+    @property
+    def queue(self) -> List[QueuedRequest]:
+        """Compatibility property for existing code that accesses .queue"""
+        return self._heap
 
     async def enqueue(
         self,
@@ -58,7 +73,7 @@ class ModelRequestQueue:
 
         async with self.lock:
             # Check queue capacity
-            if len(self.queue) >= self.max_queue_size:
+            if len(self._heap) >= self.max_queue_size:
                 self.total_rejected += 1
                 raise RuntimeError(
                     f"Queue for model '{self.model_alias}' is full ({self.max_queue_size}). "
@@ -76,16 +91,8 @@ class ModelRequestQueue:
                 response_future=response_future
             )
 
-            # Insert with priority
-            inserted = False
-            for i, existing_req in enumerate(self.queue):
-                if queued_req.sort_key < existing_req.sort_key:
-                    self.queue.insert(i, queued_req)
-                    inserted = True
-                    break
-
-            if not inserted:
-                self.queue.append(queued_req)
+            # O(log n) heap insertion instead of O(n) deque insert
+            heapq.heappush(self._heap, queued_req)
 
             self.total_requests += 1
             self.queue_not_empty.set()
@@ -98,27 +105,29 @@ class ModelRequestQueue:
             wait_time = time.time() - enqueue_time
             logger.error(
                 f"[{self.model_alias}] Request {request_id} timeout after {wait_time:.1f}s "
-                f"(queue_length={len(self.queue)}, processing={self.current_processing})"
+                f"(queue_length={len(self._heap)}, processing={self.current_processing})"
             )
-            # Remove from queue if timeout
+            # Remove from queue if timeout - O(n) but rare
             async with self.lock:
                 try:
-                    self.queue.remove(queued_req)
+                    self._heap.remove(queued_req)
+                    heapq.heapify(self._heap)  # Restore heap property
                 except ValueError:
                     pass  # Already processed
             raise TimeoutError(f"Request timeout after {timeout}s in queue")
 
     async def dequeue(self) -> Optional[QueuedRequest]:
-        """Get next request from queue."""
+        """Get next request from queue (highest priority first)."""
         async with self.lock:
-            if self.queue:
-                return self.queue.popleft()
+            if self._heap:
+                # O(log n) heap pop
+                return heapq.heappop(self._heap)
             return None
 
     def get_stats(self) -> Dict[str, Any]:
         """Get queue statistics."""
         return {
-            "queue_length": len(self.queue),
+            "queue_length": len(self._heap),
             "total_requests": self.total_requests,
             "total_processed": self.total_processed,
             "total_rejected": self.total_rejected,

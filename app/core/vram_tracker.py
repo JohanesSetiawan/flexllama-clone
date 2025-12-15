@@ -61,16 +61,16 @@ class VRAMTracker:
     Track VRAM usage per model secara dinamis dengan metode yang lebih akurat.
     """
 
-    def __init__(self, gpu_device_index: int = 0):
+    def __init__(self, gpu_device_index: int = 0, min_vram_required: int = 500):
         self.gpu_device_index = gpu_device_index
         self.gpu_handle = None
+        self.min_vram_required = min_vram_required  # Configurable minimum VRAM
 
         # Track models: {model_alias: ModelVRAMTracking}
         self.model_tracks: Dict[str, ModelVRAMTracking] = {}
         self.lock = asyncio.Lock()
 
         # Lock untuk memastikan hanya satu model yang load pada satu waktu
-        # Ini penting untuk akurasi tracking VRAM
         self.load_lock = asyncio.Lock()
         self.currently_loading: Optional[str] = None
 
@@ -82,7 +82,7 @@ class VRAMTracker:
         # Baseline VRAM (system overhead)
         self.baseline_vram_used_mb = 0.0
 
-        # Initial free VRAM (untuk referensi)
+        # Initial free VRAM
         self.initial_free_vram_mb = 0.0
 
         # Initialize NVML
@@ -122,8 +122,10 @@ class VRAMTracker:
             return {"total_mb": 0, "used_mb": 0, "free_mb": 0}
 
     async def track_model_load_start(self, model_alias: str, port: int):
-        # await self.load_lock.acquire()
-        # self.currently_loading = model_alias
+        """Start tracking a model load. Acquires load_lock for sequential loading."""
+        # Acquire load_lock to ensure only one model loads at a time
+        await self.load_lock.acquire()
+        self.currently_loading = model_alias
 
         async with self.lock:
             vram_info = self.get_current_vram_info()
@@ -137,14 +139,21 @@ class VRAMTracker:
             )
 
             logger.info(
-                f"[VRAM Tracker] Started tracking '{model_alias}' | Total VRAM used before load: {vram_info['used_mb']:.0f} MB | Free VRAM: {vram_info['free_mb']:.0f} MB"
+                f"[VRAM Tracker] Started tracking '{model_alias}' (load_lock acquired) | "
+                f"Total VRAM used before load: {vram_info['used_mb']:.0f} MB | Free VRAM: {vram_info['free_mb']:.0f} MB"
             )
 
     async def track_model_load_complete(self, model_alias: str):
+        """Mark model load as complete. Releases load_lock."""
         async with self.lock:
             if model_alias not in self.model_tracks:
                 logger.warning(
-                    f"[VRAM Tracker] Model '{model_alias}' not in tracking. ")
+                    f"[VRAM Tracker] Model '{model_alias}' not in tracking.")
+                # Still release lock if we hold it
+                if self.currently_loading == model_alias:
+                    self.currently_loading = None
+                    if self.load_lock.locked():
+                        self.load_lock.release()
                 return
 
             track = self.model_tracks[model_alias]
@@ -173,10 +182,21 @@ class VRAMTracker:
             load_duration = track.get_load_duration_sec()
 
             logger.info(
-                f"[VRAM Tracker] '{model_alias}' loaded | VRAM used by this model: {track.current_vram_used_mb:.0f} MB - ({track.current_vram_used_mb / 1024:.2f} GB) | Load time: {load_duration:.1f}s | Total VRAM used: {vram_info['used_mb']:.0f} MB | Free VRAM: {vram_info['free_mb']:.0f} MB"
+                f"[VRAM Tracker] '{model_alias}' loaded | VRAM used: {track.current_vram_used_mb:.0f} MB "
+                f"({track.current_vram_used_mb / 1024:.2f} GB) | Load time: {load_duration:.1f}s | "
+                f"Total VRAM used: {vram_info['used_mb']:.0f} MB | Free: {vram_info['free_mb']:.0f} MB"
             )
 
+        # Release load_lock after updating tracking
+        if self.currently_loading == model_alias:
+            self.currently_loading = None
+            if self.load_lock.locked():
+                self.load_lock.release()
+                logger.debug(
+                    f"[VRAM Tracker] load_lock released for '{model_alias}'")
+
     async def track_model_load_failed(self, model_alias: str, error: str):
+        """Mark model load as failed. Releases load_lock."""
         async with self.lock:
             if model_alias in self.model_tracks:
                 logger.warning(
@@ -188,6 +208,14 @@ class VRAMTracker:
                 logger.info(
                     f"[VRAM Tracker] '{model_alias}' removed from tracking (failed to load)"
                 )
+
+        # Release load_lock
+        if self.currently_loading == model_alias:
+            self.currently_loading = None
+            if self.load_lock.locked():
+                self.load_lock.release()
+                logger.debug(
+                    f"[VRAM Tracker] load_lock released for '{model_alias}' (failed)")
 
     async def track_model_eject(self, model_alias: str):
         async with self.lock:
@@ -203,6 +231,34 @@ class VRAMTracker:
                 logger.debug(
                     f"[VRAM Tracker] Model '{model_alias}' not in tracking"
                 )
+
+    def get_available_vram_mb(self) -> float:
+        """Get actual available VRAM in MB from GPU."""
+        vram_info = self.get_current_vram_info()
+        return vram_info["free_mb"]
+
+    def can_load_model(self, estimated_vram_mb: float, safety_buffer_mb: float = 200) -> tuple:
+        """
+        Check if there's enough VRAM to load a new model.
+
+        Args:
+            estimated_vram_mb: Estimated VRAM needed for the model
+            safety_buffer_mb: Extra buffer to prevent GPU OOM (default 200MB)
+
+        Returns:
+            tuple: (can_load: bool, available_mb: float, message: str)
+        """
+        available_mb = self.get_available_vram_mb()
+        required_mb = estimated_vram_mb + safety_buffer_mb
+
+        can_load = available_mb >= required_mb
+
+        if can_load:
+            message = f"VRAM OK: {available_mb:.0f} MB available, need {required_mb:.0f} MB (estimated {estimated_vram_mb:.0f} + buffer {safety_buffer_mb:.0f})"
+        else:
+            message = f"VRAM insufficient: {available_mb:.0f} MB available, need {required_mb:.0f} MB"
+
+        return can_load, available_mb, message
 
     async def update_all_tracks(self):
         async with self.lock:
@@ -298,9 +354,8 @@ class VRAMTracker:
         # Calculate estimated free VRAM for new model
         estimated_free = vram_info["free_mb"]
 
-        # Check if can load more models
-        min_vram_for_new_model = 500
-        can_load_more = estimated_free >= min_vram_for_new_model
+        # Check if can load more models (use configurable threshold)
+        can_load_more = estimated_free >= self.min_vram_required
 
         return {
             "gpu_info": {
@@ -321,7 +376,7 @@ class VRAMTracker:
             "can_load_more": can_load_more,
             "estimated_free_for_new_model_mb": round(estimated_free, 2),
             "estimated_free_for_new_model_gb": round(estimated_free / 1024, 2),
-            "status": self._get_vram_status(vram_info["free_mb"], min_vram_for_new_model)
+            "status": self._get_vram_status(vram_info["free_mb"], self.min_vram_required)
         }
 
     def _get_vram_status(self, free_mb: float, min_required: float) -> str:

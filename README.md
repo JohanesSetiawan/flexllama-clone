@@ -1,256 +1,477 @@
 # RouterModelCustom
 
-RouterModelCustom is a robust and efficient model manager and router designed to orchestrate Local Large Language Model (LLM) inference. It acts as a middleware between client applications and `llama-server` instances, providing dynamic model loading, resource management, request queuing, and an OpenAI-compatible API interface.
+<div align="center">
 
-This project aims to simplify the deployment of multiple local LLMs by handling the complexities of process management, GPU resource allocation, and concurrent request handling.
+**A robust model router and manager for Local LLM inference**
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+</div>
+
+RouterModelCustom is middleware between client applications and `llama-server` instances, providing **dynamic model loading**, **resource management**, **request queuing**, and an **OpenAI-compatible API**.
+
+---
 
 ## Table of Contents
 
-- [RouterModelCustom](#routermodelcustom)
-  - [Table of Contents](#table-of-contents)
-  - [Features](#features)
+- [Features](#features)
+- [Architecture Overview](#architecture-overview)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
   - [Installation](#installation)
-    - [Prerequisites](#prerequisites)
-    - [Steps](#steps)
   - [Configuration](#configuration)
-    - [Custom Configuration](#custom-configuration)
-      - [System Configuration (`system`)](#system-configuration-system)
-      - [API Configuration (`api`)](#api-configuration-api)
-      - [Model Configuration (`models`)](#model-configuration-models)
-  - [Usage](#usage)
-    - [Starting the Server](#starting-the-server)
-    - [Making Requests](#making-requests)
-  - [API Endpoints](#api-endpoints)
-    - [OpenAI Compatible](#openai-compatible)
-    - [Management \& Monitoring](#management--monitoring)
-  - [Project Structure](#project-structure)
+- [Usage](#usage)
+  - [Starting the Server](#starting-the-server)
+  - [Making Requests](#making-requests)
+  - [Priority Queue](#priority-queue)
+  - [Streaming Responses](#streaming-responses)
+- [Monitoring](#monitoring)
+  - [Quick Start (Docker)](#quick-start-docker)
+  - [Access Dashboards](#access-dashboards)
+  - [Prometheus Metrics](#prometheus-metrics)
+- [API Reference](#api-reference)
+  - [OpenAI Compatible](#openai-compatible)
+  - [Management](#management)
+  - [Monitoring Endpoints](#monitoring-endpoints)
+  - [Realtime Status (SSE)](#realtime-status-sse)
+- [Configuration Reference](#configuration-reference)
+- [Project Structure](#project-structure)
+- [Technologies Used](#technologies-used)
+
+---
 
 ## Features
 
-- **Dynamic Model Management**: Automatically loads and unloads models based on usage and configuration.
-- **Resource Optimization**: Manages GPU/CPU resources and limits concurrent model instances.
-- **Request Queuing**: Implements a queue system to handle high traffic and prevent server overload.
-- **OpenAI Compatible API**: Provides a standard interface for easy integration with existing tools.
-- **Health & Metrics**: Built-in endpoints for monitoring system health and performance metrics.
-- **Robust Error Handling**: Includes retry mechanisms and graceful shutdown procedures.
+| Feature                         | Description                                                         |
+| ------------------------------- | ------------------------------------------------------------------- |
+| 🔄 **Dynamic Model Management** | Auto-load/unload models based on demand and VRAM availability       |
+| ⚡ **Priority Queue System**    | HIGH/NORMAL/LOW priority with heap-based scheduling                 |
+| 🎯 **OpenAI Compatible API**    | Drop-in replacement for `/v1/chat/completions` and `/v1/embeddings` |
+| 📊 **Prometheus + Grafana**     | Built-in monitoring with pre-configured dashboards                  |
+| 🔥 **Model Preloading**         | Warmup models on startup with `preload_models: ["*"]`               |
+| 💾 **VRAM Management**          | Real-time tracking and guards to prevent OOM                        |
+| 🏥 **Health Monitoring**        | Auto-restart crashed models, health checks every 30s                |
+| 🌊 **Streaming Support**        | Server-Sent Events for both inference and status updates            |
 
-## Installation
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Client Applications                       │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │
+                    POST /v1/chat/completions
+                         {model: "alias"}
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    RouterModelCustom (FastAPI)                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │
+│  │ Queue    │  │ Warmup   │  │ VRAM     │  │ Health           │ │
+│  │ Manager  │  │ Manager  │  │ Tracker  │  │ Monitor          │ │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────────┬─────────┘ │
+│       │             │             │                  │           │
+│       └─────────────┴─────────────┴──────────────────┘           │
+│                             │                                    │
+│                    ┌────────┴────────┐                           │
+│                    │  Model Manager  │                           │
+│                    └────────┬────────┘                           │
+└─────────────────────────────┼───────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+          ▼                   ▼                   ▼
+   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+   │ llama-server│     │ llama-server│     │ llama-server│
+   │   :8085     │     │   :8086     │     │   :8087     │
+   │  (Model A)  │     │  (Model B)  │     │  (Model C)  │
+   └──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+          │                   │                   │
+          └───────────────────┴───────────────────┘
+                              │
+                      ┌───────┴───────┐
+                      │   GPU VRAM    │
+                      └───────────────┘
+```
+
+---
+
+## Getting Started
 
 ### Prerequisites
 
-- Python 3.10 or higher
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) (specifically the `llama-server` binary)
-- NVIDIA GPU (optional, for GPU acceleration) with drivers installed.
+| Requirement    | Version  | Notes                               |
+| -------------- | -------- | ----------------------------------- |
+| **Python**     | 3.10+    | Required                            |
+| **llama.cpp**  | Latest   | Specifically `llama-server` binary  |
+| **NVIDIA GPU** | Optional | For GPU acceleration                |
+| **Docker**     | Optional | For Prometheus + Grafana monitoring |
 
-### Steps
+### Installation
 
-1.  **Clone the repository:**
-
-    ```bash
-    git clone https://github.com/JohanesSetiawan/flexllama-clone.git
-    cd flexllama-clone
-    ```
-
-2.  **Install dependencies:**
-
-    It is recommended to use a virtual environment.
-
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
-    pip install -r requirements.txt
-    ```
-
-3.  **Prepare `llama-server`:**
-
-    Ensure you have the `llama-server` binary compiled and available. Update the path in `config.json` (see Configuration).
-
-## Configuration
-
-The application is configured via `config.json`. You can start by copying the original config:
+#### 1. Clone the Repository
 
 ```bash
-cp configOriginal.json config.json
+git clone https://github.com/JohanesSetiawan/flexllama-clone.git
+cd flexllama-clone
 ```
 
-### Custom Configuration
+#### 2. Create Virtual Environment
 
-You can customize `config.json` to suit your hardware and requirements. The configuration is validated at startup to ensure stability. Below are the available options and their constraints based on the system validation logic.
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/macOS
+# OR
+venv\Scripts\activate     # Windows
+```
 
-#### System Configuration (`system`)
+#### 3. Install Dependencies
 
-| Key | Type | Default | Constraints | Description |
-|-----|------|---------|-------------|-------------|
-| `llama_server_path` | string | env var | File must exist & executable | Absolute path to `llama-server` binary. |
-| `max_concurrent_models` | int | 3 | 1 - 10 | Maximum number of models loaded simultaneously. |
-| `idle_timeout_sec` | int | 300 | 60 - 86400 | Time in seconds before an unused model is unloaded. |
-| `request_timeout_sec` | int | 300 | 30 - 3600 | Timeout for requests to `llama-server`. |
-| `gpu_devices` | list[int] | [0] | - | List of GPU device IDs to use. |
-| `parallel_requests` | int | 4 | 1 - 32 | Number of parallel requests per model. |
-| `cpu_threads` | int | 8 | 1 - 64 | Number of CPU threads for non-GPU ops. |
-| `use_mmap` | bool | true | - | Use memory mapping for model loading. |
-| `flash_attention` | string | "on" | "on", "off", "auto" | Flash Attention mode. |
-| `max_queue_size_per_model` | int | 100 | 10 - 1000 | Max queue size per model. |
-| `queue_timeout_sec` | int | 300 | 30 - 600 | Timeout for queued requests. |
+```bash
+pip install -r requirements.txt
+```
 
-#### API Configuration (`api`)
+**Dependencies installed:**
 
-| Key | Type | Default | Constraints | Description |
-|-----|------|---------|-------------|-------------|
-| `host` | string | "0.0.0.0" | - | Host to bind the server to. |
-| `port` | int | 8000 | 1024 - 65535 | Port to bind the server to. |
-| `cors_origins` | list[str] | ["http://localhost:3000"] | - | Allowed origins for CORS. |
+- `fastapi[standard]` - Web framework
+- `httpx[http2]` - Async HTTP client
+- `pydantic` - Data validation
+- `uvicorn` - ASGI server
+- `pynvml` - NVIDIA GPU monitoring
+- `aiohttp` - Async HTTP for SSE
+- `prometheus-client` - Metrics exposition
 
-#### Model Configuration (`models`)
+#### 4. Prepare llama-server
 
-Define your models under the `models` key. The key name serves as the model ID (alias) used in API requests.
+Download or compile `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp):
 
-| Key | Type | Default | Constraints | Description |
-|-----|------|---------|-------------|-------------|
-| `model_path` | string | Required | File must exist & end with `.gguf` | Absolute path to the `.gguf` model file. |
-| `params.n_gpu_layers` | int | 99 | >= -1 | Number of layers to offload to GPU. |
-| `params.n_ctx` | int | 4096 | 4096 - 8192 | Context size. |
-| `params.n_batch` | int | 8 | 8 - 512 | Batch size for prompt processing. |
-| `params.embedding` | bool | false | - | Set to `true` for embedding models. |
-| `params.type_k` | string | "f16" | Valid quant types | Cache type for K (e.g., f16, q8_0, q4_0). |
-| `params.type_v` | string | "f16" | Valid quant types | Cache type for V (e.g., f16, q8_0, q4_0). |
+```bash
+# Example: Download pre-built binary (check llama.cpp releases)
+# OR compile from source:
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+make llama-server GGML_CUDA=1  # With CUDA support
+```
 
-**Example `config.json`:**
+### Configuration
+
+#### 1. Create Config File
+
+```bash
+cp .example.config.json config.json
+```
+
+#### 2. Edit Configuration
 
 ```json
 {
-    "api": {
-        "host": "0.0.0.0",
-        "port": 8000
+  "api": {
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+  "system": {
+    "llama_server_path": "/path/to/llama-server",
+    "max_concurrent_models": 3,
+    "preload_models": ["*"],
+    "enable_idle_timeout": false,
+    "gpu_devices": [0],
+    "flash_attention": "on"
+  },
+  "models": {
+    "qwen-7b": {
+      "model_path": "/path/to/models/qwen-7b.gguf",
+      "params": {
+        "n_gpu_layers": 99,
+        "n_ctx": 8192
+      }
     },
-    "system": {
-        "idle_timeout_sec": 300,
-        "llama_server_path": "/app/llama-server",
-        "max_concurrent_models": 2,
-        "gpu_devices": [0],
-        "flash_attention": "on"
-    },
-    "models": {
-        "qwen3-4b-chat": {
-            "model_path": "/app/models/Qwen3-4B-Instruct.gguf",
-            "params": {
-                "n_gpu_layers": 99,
-                "n_ctx": 4096
-            }
-        }
+    "llama-3b": {
+      "model_path": "/path/to/models/llama-3b.gguf",
+      "params": {
+        "n_gpu_layers": 99,
+        "n_ctx": 4096
+      }
     }
+  }
 }
 ```
+
+> **TIP:** Use `"preload_models": ["*"]` to load ALL models on startup (ideal for avoiding cold-start latency).
+
+---
 
 ## Usage
 
 ### Starting the Server
 
-Run the application using the provided runner script:
-
 ```bash
 python run.py
 ```
 
-The server will start on the host and port specified in `config.json` (default: `0.0.0.0:8000`).
+The server starts on the configured host:port (default: `http://0.0.0.0:8000`).
 
 ### Making Requests
 
-You can interact with the server using standard HTTP clients. Here is an example using `curl` for a chat completion:
+#### Chat Completion
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-4b-chat",
+    "model": "qwen-7b",
     "messages": [
-      {"role": "user", "content": "Hello, how are you?"}
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Hello!"}
     ]
   }'
 ```
 
-## API Endpoints
+#### Embeddings
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "embedding-model",
+    "input": "The quick brown fox"
+  }'
+```
+
+#### List Available Models
+
+```bash
+curl http://localhost:8000/v1/models
+```
+
+### Priority Queue
+
+Set request priority via header:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Request-Priority: high" \
+  -d '{"model": "qwen-7b", "messages": [...]}'
+```
+
+| Priority | Value | Use Case                           |
+| -------- | ----- | ---------------------------------- |
+| `high`   | 1     | Real-time chat, critical requests  |
+| `normal` | 2     | Default for most requests          |
+| `low`    | 3     | Batch processing, background tasks |
+
+### Streaming Responses
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen-7b",
+    "messages": [{"role": "user", "content": "Tell me a story"}],
+    "stream": true
+  }'
+```
+
+---
+
+## Monitoring
+
+### Quick Start (Docker)
+
+Start Prometheus + Grafana with one command:
+
+```bash
+docker compose -f docker-compose.monitoring.yml up -d
+```
+
+This will:
+
+- Start **Prometheus** on port `9090`
+- Start **Grafana** on port `3000`
+- Auto-configure data sources and dashboards
+
+### Access Dashboards
+
+| Service        | URL                   | Credentials       |
+| -------------- | --------------------- | ----------------- |
+| **Grafana**    | http://localhost:3000 | `admin` / `admin` |
+| **Prometheus** | http://localhost:9090 | -                 |
+
+### Prometheus Metrics
+
+The router exposes metrics at `GET /metrics`:
+
+```
+# HELP router_requests_total Total requests processed
+# TYPE router_requests_total counter
+router_requests_total{model="qwen-7b",status="success"} 1234
+
+# HELP router_model_vram_bytes VRAM usage per model
+# TYPE router_model_vram_bytes gauge
+router_model_vram_bytes{model="qwen-7b"} 4294967296
+
+# HELP router_queue_depth Current queue depth per model
+# TYPE router_queue_depth gauge
+router_queue_depth{model="qwen-7b"} 5
+```
+
+### Stop Monitoring
+
+```bash
+docker compose -f docker-compose.monitoring.yml down
+```
+
+---
+
+## API Reference
 
 ### OpenAI Compatible
 
-- **`POST /v1/chat/completions`**: Chat completion endpoint. Compatible with OpenAI client libraries.
-- **`POST /v1/embeddings`**: Generate embeddings for text input.
-- **`GET /v1/models`**: List all available models configured in the system.
+| Endpoint               | Method | Description                           |
+| ---------------------- | ------ | ------------------------------------- |
+| `/v1/chat/completions` | POST   | Chat completion (streaming supported) |
+| `/v1/embeddings`       | POST   | Generate embeddings                   |
+| `/v1/models`           | GET    | List available models                 |
 
-### Management & Monitoring
+### Management
 
-- **`GET /health`**: General system health check. Returns status of the router.
-- **`GET /metrics`**: Prometheus-compatible metrics endpoint.
-- **`GET /vram`**: Current VRAM usage status across configured GPUs.
-- **`GET /v1/health/models`**: Detailed health status of all loaded models.
-- **`GET /v1/queue/stats`**: Current statistics of the request queue (pending requests, processing, etc.).
-- **`GET /v1/telemetry/summary`**: Summary of telemetry data (requests count, tokens generated, etc.).
-- **`GET /v1/models/{model_alias}/status`**: Check the specific loading status of a model.
-- **`GET /v1/models/failed`**: List models that failed to load or crashed.
-- **`POST /v1/models/eject`**: Manually unload a model from memory.
-    - Body: `{"model": "model_alias"}`
-- **`POST /v1/models/{model_alias}/reset`**: Reset the failure state for a model, allowing it to be reloaded.
+| Endpoint                    | Method | Description                                        |
+| --------------------------- | ------ | -------------------------------------------------- |
+| `/v1/models/eject`          | POST   | Unload model from VRAM. Body: `{"model": "alias"}` |
+| `/v1/models/{alias}/reset`  | POST   | Reset failed model status                          |
+| `/v1/models/{alias}/status` | GET    | Get loading status of specific model               |
+| `/v1/models/failed`         | GET    | List models that failed to load                    |
 
-### Realtime Model Status (NEW)
+### Monitoring Endpoints
 
-Endpoints untuk monitoring status model secara realtime, cocok untuk dashboard frontend.
+| Endpoint                | Method | Description                    |
+| ----------------------- | ------ | ------------------------------ |
+| `/health`               | GET    | Server health check            |
+| `/metrics`              | GET    | Prometheus metrics             |
+| `/metrics/stream`       | GET    | SSE metrics stream             |
+| `/vram`                 | GET    | VRAM usage report              |
+| `/v1/queue/stats`       | GET    | Queue statistics               |
+| `/v1/telemetry/summary` | GET    | Request telemetry              |
+| `/v1/health/models`     | GET    | Health status of loaded models |
 
-- **`GET /v1/models/status`**: Get status semua model secara lengkap.
-    - Returns: `{ server: {...}, models: {...}, summary: {...} }`
-    - Status yang mungkin: `off`, `starting`, `loading`, `ready`, `loaded`, `stopping`, `crashed`, `failed`
+### Realtime Status (SSE)
 
-- **`GET /v1/models/status/{model_alias}`**: Get status untuk satu model spesifik.
-
-- **`GET /v1/models/status/stream`**: **SSE (Server-Sent Events) endpoint** untuk realtime updates.
-    - Event types: `full_status`, `model_update`, `server_update`, `heartbeat`
-    - Contoh penggunaan di frontend:
-    ```javascript
-    const eventSource = new EventSource('/v1/models/status/stream');
-    
-    eventSource.addEventListener('full_status', (e) => {
-        const data = JSON.parse(e.data);
-        console.log('Initial status:', data);
-    });
-    
-    eventSource.addEventListener('model_update', (e) => {
-        const data = JSON.parse(e.data);
-        console.log('Model updated:', data.alias, data.status);
-    });
-    
-    eventSource.addEventListener('heartbeat', (e) => {
-        console.log('Connection alive');
-    });
-    ```
-
-- **`GET /v1/models/status/file`**: Get status dari file (fallback untuk pre-startup).
-    - File `model_status.json` di-update setiap ada perubahan status.
-    - Bisa digunakan untuk polling jika SSE belum tersedia.
-
-#### Standalone Status Server (Optional)
-
-Untuk kasus dimana perlu akses status sebelum FastAPI fully ready, tersedia lightweight status server terpisah:
+#### Get All Model Status
 
 ```bash
-# Jalankan di port 8001 (paralel dengan main server)
-python -m app.core.status_server --port 8001
+curl http://localhost:8000/v1/models/status
 ```
 
-Endpoints pada status server:
-- `GET /health` - Health check
-- `GET /status` - Get all status
-- `GET /status/{alias}` - Get model status
-- `GET /status/stream` - SSE stream
+Response:
+
+```json
+{
+  "server": { "status": "ready" },
+  "models": {
+    "qwen-7b": { "status": "ready", "port": 8085, "vram_mb": 4096 },
+    "llama-3b": { "status": "off" }
+  },
+  "summary": { "ready": 1, "off": 1 }
+}
+```
+
+#### Stream Status Updates
+
+```javascript
+const eventSource = new EventSource("/v1/models/status/stream");
+
+eventSource.addEventListener("full_status", (e) => {
+  console.log("Initial:", JSON.parse(e.data));
+});
+
+eventSource.addEventListener("model_update", (e) => {
+  const data = JSON.parse(e.data);
+  console.log(`Model ${data.alias}: ${data.status}`);
+});
+```
+
+---
+
+## Configuration Reference
+
+### System Configuration (`system`)
+
+| Key                        | Type   | Default | Description                                                                                                             |
+| -------------------------- | ------ | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `llama_server_path`        | string | -       | Absolute path to the `llama-server` executable binary from llama.cpp                                                    |
+| `max_concurrent_models`    | int    | 3       | Maximum number of models that can be loaded into VRAM at the same time                                                  |
+| `preload_models`           | list   | `[]`    | List of model aliases to load on startup. Use `["*"]` to preload all models defined in config                           |
+| `enable_idle_timeout`      | bool   | true    | When enabled, automatically unloads models from VRAM after being idle. Set to `false` to keep models loaded permanently |
+| `idle_timeout_sec`         | int    | 300     | Time in seconds a model can remain unused before being unloaded from VRAM                                               |
+| `request_timeout_sec`      | int    | 120     | Maximum time in seconds to wait for a response from llama-server before timing out                                      |
+| `gpu_devices`              | list   | `[0]`   | List of GPU device indices to use for model inference (e.g., `[0]` for first GPU)                                       |
+| `parallel_requests`        | int    | 1       | Number of concurrent requests each model instance can handle simultaneously                                             |
+| `cpu_threads`              | int    | 8       | Number of CPU threads allocated for model operations (prompt processing, non-GPU tasks)                                 |
+| `flash_attention`          | string | `"on"`  | Flash Attention mode for faster inference. Options: `"on"`, `"off"`, or `"auto"`                                        |
+| `max_queue_size_per_model` | int    | 500     | Maximum number of requests that can wait in queue per model before rejecting new requests                               |
+| `vram_multiplier`          | float  | 1.1     | Multiplier applied to model file size when estimating VRAM requirements (1.1 = 10% buffer)                              |
+
+### Model Configuration (`models.{alias}`)
+
+| Key                   | Type   | Default  | Description                                                                                           |
+| --------------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
+| `model_path`          | string | Required | Absolute path to the GGUF model file on disk                                                          |
+| `params.n_gpu_layers` | int    | 99       | Number of model layers to offload to GPU. Use `99` to offload all layers, `-1` for CPU-only inference |
+| `params.n_ctx`        | int    | 4096     | Context window size in tokens. Larger values allow longer conversations but use more VRAM             |
+| `params.embedding`    | bool   | false    | Set to `true` for embedding models to enable the `/v1/embeddings` endpoint                            |
+| `params.type_k`       | string | `"f16"`  | Data type for KV cache keys. Options: `"f16"`, `"q8_0"`, `"q4_0"`. Lower precision saves VRAM         |
+| `params.type_v`       | string | `"f16"`  | Data type for KV cache values. Options: `"f16"`, `"q8_0"`, `"q4_0"`. Lower precision saves VRAM       |
+
+---
 
 ## Project Structure
 
 ```
 .
 ├── app/
-│   ├── core/           # Core logic (manager, queue, config, etc.)
-│   ├── main.py         # FastAPI application entry point
-│   └── ...
-├── config.json         # Main configuration file
-├── run.py              # Server startup script
-├── requirements.txt    # Python dependencies
-└── README.md           # Documentation
+│   ├── core/
+│   │   ├── config.py          # Configuration loading & validation
+│   │   ├── manager.py         # RunnerProcess & ModelManager
+│   │   ├── queue.py           # Priority queue system
+│   │   ├── warmup.py          # Model preloading
+│   │   ├── vram_tracker.py    # GPU VRAM monitoring
+│   │   ├── health_monitor.py  # Health checks
+│   │   ├── prometheus_metrics.py  # Metrics collection
+│   │   └── ...
+│   └── main.py                # FastAPI application
+├── monitoring/
+│   ├── prometheus.yml         # Prometheus scrape config
+│   └── grafana/
+│       └── provisioning/      # Grafana datasources & dashboards
+├── .example.config.json       # Example configuration
+├── docker-compose.monitoring.yml  # Prometheus + Grafana
+├── requirements.txt           # Python dependencies
+├── run.py                     # Server entry point
+└── README.md
 ```
+
+---
+
+## Technologies Used
+
+| Category           | Technologies                   |
+| ------------------ | ------------------------------ |
+| **Backend**        | Python 3.10+, FastAPI, Uvicorn |
+| **LLM Inference**  | llama.cpp (llama-server)       |
+| **GPU Monitoring** | pynvml (NVIDIA)                |
+| **HTTP Client**    | httpx (async)                  |
+| **Queue**          | heapq (priority heap)          |
+| **Monitoring**     | Prometheus, Grafana            |
+| **Validation**     | Pydantic                       |
+
+---
+
+<div align="center">
+
+**Made with ❤️ for the local LLM community**
+
+</div>

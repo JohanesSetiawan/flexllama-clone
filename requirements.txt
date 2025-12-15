@@ -6,3 +6,5 @@ pynvml
 aiohttp
 rich
 tabulate
+prometheus-client
+psutil

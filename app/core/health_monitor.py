@@ -129,6 +129,9 @@ class HealthMonitor:
                         if runner.is_alive() and runner.status == "ready"
                     }
 
+                # Track models that need restart (detected as down)
+                models_to_restart = set()
+
                 # Check health untuk setiap model
                 for alias, runner in active_models.items():
                     result = await self.check_model_health(alias, runner)
@@ -149,18 +152,23 @@ class HealthMonitor:
 
                         if self.model_health[alias].is_down:
                             logger.error(
-                                f"Model '{alias}' is DOWN. Attempting restart."
+                                f"Model '{alias}' is DOWN. Will attempt restart."
                             )
-                            # Attempt restart
-                            try:
-                                await self.manager.eject_model(alias)
-                                await asyncio.sleep(2)
-                                await self.manager.get_runner_for_request(alias)
-                                logger.info(
-                                    f"Model '{alias}' successfully restarted")
-                            except Exception as e:
-                                logger.error(
-                                    f"Failed to restart model '{alias}': {e}")
+                            # Mark for restart - actual restart will happen outside lock
+                            models_to_restart.add(alias)
+
+                # Perform restarts OUTSIDE of lock to prevent blocking health checks
+                for alias in models_to_restart:
+                    try:
+                        logger.info(f"Attempting restart for '{alias}'")
+                        await self.manager.eject_model(alias)
+                        await asyncio.sleep(2)
+                        await self.manager.get_runner_for_request(alias)
+                        logger.info(
+                            f"Model '{alias}' successfully restarted")
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to restart model '{alias}': {e}")
 
                 # Clean up health tracking untuk models yang sudah tidak active
                 async with self.lock:

@@ -48,9 +48,9 @@ class SystemConfig(BaseModel):
     )
 
     preload_delay_sec: int = Field(
-        default=30,
+        default=5,  # Reduced from 30s - faster startup for small models
         ge=1,
-        le=300,
+        le=120,  # Reduced max from 300 to 120
         description="Delay (detik) antar preload model untuk menghindari VRAM overflow. "
                     "Berguna saat preload multiple models."
     )
@@ -138,6 +138,38 @@ class SystemConfig(BaseModel):
         description="Digunakan untuk menunggu status ready setelah mendapatkan runner"
     )
 
+    # HTTP Client Configuration
+    http_max_keepalive: int = Field(
+        default=100,
+        ge=10,
+        le=500,
+        description="Maksimum keepalive connections untuk HTTP client ke llama-server"
+    )
+
+    http_max_connections: int = Field(
+        default=200,
+        ge=20,
+        le=1000,
+        description="Maksimum total connections untuk HTTP client ke llama-server"
+    )
+
+    # Queue Processor Configuration
+    queue_processor_idle_sec: int = Field(
+        default=120,
+        ge=30,
+        le=600,
+        description="Waktu idle (detik) sebelum queue processor berhenti. "
+                    "Tingkatkan untuk workload dengan high latency."
+    )
+
+    # Model Loading Configuration
+    model_load_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="Maksimum retry saat model gagal load. Set 0 untuk tidak retry."
+    )
+
     @field_validator('llama_server_path')
     @classmethod
     def validate_llama_server_path(cls, v: str) -> str:
@@ -157,7 +189,7 @@ class SystemConfig(BaseModel):
 class ModelParams(BaseModel):
     n_gpu_layers: int = Field(default=99, ge=-1)
     n_ctx: int = Field(default=4096, ge=512, le=131072)
-    n_batch: int = Field(default=8, ge=8, le=512)
+    n_batch: int = Field(default=256, ge=128, le=512)
     rope_freq_base: Optional[int] = Field(
         default=None,
         ge=0,

@@ -14,6 +14,7 @@ from .vram_tracker import VRAMTracker
 from .errors import InsufficientVRAMError
 from .config import AppConfig, ModelConfig
 from .gguf_utils import get_optimal_parallel, get_model_info
+from .prometheus_metrics import get_prometheus_collector
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class RunnerProcess:
 
         # Retry jika crash
         self.retry_count = 0
-        self.max_retries = 2  # Max 2 kali
+        self.max_retries = system_config.model_load_max_retries
 
     def is_alive(self) -> bool:
         if self.process is None:
@@ -106,7 +107,7 @@ class RunnerProcess:
             self.llama_server_path, "--model", self.config.model_path,
             "--host", "127.0.0.1", "--port", str(self.port),
             "--n-gpu-layers", str(params.n_gpu_layers),
-            "--ctx-size", str(params.n_ctx), "--mlock"
+            "--ctx-size", str(params.n_ctx), "--mlock", "--jinja"
         ]
 
         # Context shifting: DISABLE untuk non-SWA models, ENABLE untuk SWA models
@@ -175,34 +176,41 @@ class RunnerProcess:
 
         # Buka log file untuk stdout dan stderr
         log_handle = open(self.log_file, 'w')
+        self.log_handle = log_handle  # Store early for cleanup in stop()
 
-        self.process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT
-        )
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT
+            )
 
-        # Simpan handle untuk di-close nanti
-        self.log_handle = log_handle
+            # Track waktu mulai subprocess
+            subprocess_start = time.time()
 
-        # Track waktu mulai subprocess
-        subprocess_start = time.time()
+            # Tunggu sampai subprocess benar-benar start
+            subprocess_time = time.time() - subprocess_start
 
-        # Tunggu sampai subprocess benar-benar start
-        subprocess_time = time.time() - subprocess_start
+            # Tunggu sampai siap via health check
+            health_check_start = time.time()
+            await self._wait_for_ready()
+            health_check_time = time.time() - health_check_start
+            total_startup_time = time.time() - self.started_time
 
-        # Tunggu sampai siap via health check
-        health_check_start = time.time()
-        await self._wait_for_ready()
-        health_check_time = time.time() - health_check_start
-        total_startup_time = time.time() - self.started_time
+            self.last_used_time = time.time()
+            self.status = "ready"
 
-        self.last_used_time = time.time()
-        self.status = "ready"
-
-        logger.info(
-            f"[{self.alias}] READY at {self.url} | Total: {total_startup_time:.2f}s | (subprocess: {subprocess_time:.2f}s, loading: {health_check_time:.2f}s)"
-        )
+            logger.info(
+                f"[{self.alias}] READY at {self.url} | Total: {total_startup_time:.2f}s | (subprocess: {subprocess_time:.2f}s, loading: {health_check_time:.2f}s)"
+            )
+        except Exception as e:
+            # Close log handle on exception to prevent file descriptor leak
+            if log_handle and not log_handle.closed:
+                try:
+                    log_handle.close()
+                except:
+                    pass
+            raise  # Re-raise the exception
 
     async def stop(self):
         """
@@ -296,18 +304,19 @@ class RunnerProcess:
         start_time = time.time()
         last_log_time = 0
 
-        # Adaptive polling intervals
+        # Optimized adaptive polling intervals - faster initial checks
+        # Small models (like gemma3-270m) can be ready in <1s, so we poll aggressively
         poll_intervals = [
-            0.05,   # 50ms - very fast initial checks
+            0.02,   # 20ms - very fast initial checks for quick models
+            0.02,
+            0.05,   # 50ms
             0.05,
-            0.1,    # 100ms
+            0.1,    # 100ms - transition
             0.1,
             0.2,    # 200ms
-            0.2,
+            0.3,    # 300ms
             0.5,    # 500ms - for slower loads
             0.5,
-            1.0,    # 1s - fallback for very slow loads
-            1.0
         ]
         poll_index = 0
         max_fast_polls = len(poll_intervals)
@@ -370,16 +379,17 @@ class RunnerProcess:
                     logger.debug(
                         f"[{self.alias}] Health check timeout")
 
-            # Adaptive sleep - fast at first, slower later
-            if poll_index < max_fast_polls:
-                sleep_time = poll_intervals[poll_index]
-                poll_index += 1
-            else:
-                # After fast polling phase, use 1 second interval
-                sleep_time = 1.0
+                # Adaptive sleep - fast at first, slower later
+                # MUST be inside while loop for proper polling
+                if poll_index < max_fast_polls:
+                    sleep_time = poll_intervals[poll_index]
+                    poll_index += 1
+                else:
+                    # After fast polling phase, use 1 second interval
+                    sleep_time = 1.0
 
-            await asyncio.sleep(sleep_time)
-            iteration += 1
+                await asyncio.sleep(sleep_time)
+                iteration += 1
 
         # Timeout reached
         elapsed = time.time() - start_time
@@ -401,15 +411,15 @@ class ModelManager:
         self.used_ports = set()
         self.lock = asyncio.Lock()
         self.gpu_devices = config.system.gpu_devices
-        self.gpu_allocator_index = 0
-        self.gpu_loads: Dict[int, float] = {
-            gpu: 0.0 for gpu in self.gpu_devices}
 
         # {model_alias: {error: str, attempts: int}}
         self.failed_models: Dict[str, Dict] = {}
 
         # VRAM Tracker initialization
-        self.vram_tracker = VRAMTracker(gpu_device_index=self.gpu_devices[0])
+        self.vram_tracker = VRAMTracker(
+            gpu_device_index=self.gpu_devices[0],
+            min_vram_required=config.system.min_vram_required
+        )
         self.vram_tracker.start_monitoring()
         logger.info("VRAM Tracker initialized and monitoring started")
 
@@ -562,19 +572,36 @@ class ModelManager:
                 model_conf = self.config.models[model_alias]
                 model_path = Path(model_conf.model_path)
                 model_size_mb = model_path.stat().st_size / (1024**2)
-                model_size_gb = model_size_mb / 1024
 
-                # Estimate VRAM needed based on model size
+                # Better VRAM estimation formula:
+                # GGUF models typically use 1.5-3x file size in VRAM depending on:
+                # - n_ctx (KV cache)
+                # - n_batch (batch processing memory)
+                # - CUDA overhead
+                n_ctx = model_conf.params.n_ctx
                 vram_multiplier = self.config.system.vram_multiplier
-                estimated_vram_needed_mb = (
-                    model_size_mb * vram_multiplier) + 150
+
+                # Base estimation: file_size * multiplier
+                base_vram = model_size_mb * vram_multiplier
+
+                # Additional KV cache estimation (rough approximation)
+                # For typical models: ~0.5MB per 1K context
+                kv_cache_estimate = (n_ctx / 1024) * 50  # 50MB per 1K context
+
+                # Total estimation with overhead
+                estimated_vram_needed_mb = base_vram + \
+                    kv_cache_estimate + 150  # 150MB CUDA overhead
 
                 # Minimum threshold from config
                 min_vram_required = self.config.system.min_vram_required
                 estimated_vram_needed_mb = max(
                     estimated_vram_needed_mb, min_vram_required)
 
-                logger.info(f"[{model_alias}] sedang bersiap diri.")
+                logger.info(
+                    f"[{model_alias}] Preparing to load | File: {model_size_mb:.0f} MB | "
+                    f"Estimated VRAM: {estimated_vram_needed_mb:.0f} MB (base: {base_vram:.0f} + KV: {kv_cache_estimate:.0f} + overhead)"
+                )
+
                 metrics["models_loaded_total"] += 1  # Track metric
                 new_port = self._allocate_port()
 
@@ -589,14 +616,19 @@ class ModelManager:
                 runner.status = "starting"
                 self.active_runners[model_alias] = runner
 
-                # Init VRAM Tracker to trigger this acquires load_lock and waits for other models
+                # Acquire load_lock and track model load start
+                # This ensures sequential loading and accurate VRAM measurement
                 await self.vram_tracker.track_model_load_start(model_alias, new_port)
 
-                # Check VRAM after acquiring lock
-                vram_report = self.vram_tracker.get_vram_report()
-                free_vram_mb = vram_report["estimated_free_for_new_model_mb"]
+                # Use can_load_model() for real-time VRAM check
+                can_load, available_mb, vram_message = self.vram_tracker.can_load_model(
+                    estimated_vram_mb=estimated_vram_needed_mb,
+                    safety_buffer_mb=200  # 200MB safety buffer
+                )
 
-                if free_vram_mb < estimated_vram_needed_mb:
+                logger.info(f"[{model_alias}] VRAM check: {vram_message}")
+
+                if not can_load:
                     # Not enough VRAM - cleanup and reject
                     loaded_models = [
                         alias for alias, r in self.active_runners.items()
@@ -607,22 +639,21 @@ class ModelManager:
                     self._release_port(new_port)
                     del self.active_runners[model_alias]
 
-                    # Release VRAM tracker lock
+                    # Release VRAM tracker lock (this also releases load_lock)
                     await self.vram_tracker.track_model_load_failed(
                         model_alias,
-                        f"Insufficient VRAM: need {estimated_vram_needed_mb:.0f} MB, have {free_vram_mb:.0f} MB"
+                        f"Insufficient VRAM: need {estimated_vram_needed_mb + 200:.0f} MB, have {available_mb:.0f} MB"
                     )
 
                     raise InsufficientVRAMError(
                         model_alias=model_alias,
-                        required_mb=estimated_vram_needed_mb,
-                        available_mb=free_vram_mb,
+                        required_mb=estimated_vram_needed_mb + 200,
+                        available_mb=available_mb,
                         loaded_models=loaded_models
                     )
 
                 logger.info(
-                    f"[{model_alias}] VRAM check passed"
-                )
+                    f"[{model_alias}] VRAM check passed - proceeding with load")
 
         # Retry logic with proper error handling
         max_retries = runner.max_retries
@@ -656,8 +687,25 @@ class ModelManager:
                 if model_alias in self.failed_models:
                     del self.failed_models[model_alias]
 
-                # nek iso, panggil func track.model.load_complete
+                # Track VRAM load complete
                 await self.vram_tracker.track_model_load_complete(model_alias)
+
+                # Track to Prometheus metrics
+                prom_collector = get_prometheus_collector()
+                if prom_collector:
+                    load_duration = time.time() - runner.started_time if runner.started_time else 0
+                    vram_bytes = 0
+                    if model_alias in self.vram_tracker.model_tracks:
+                        vram_bytes = self.vram_tracker.model_tracks[
+                            model_alias].current_vram_used_mb * 1024 * 1024
+                    prom_collector.record_model_load_complete(
+                        model_alias, load_duration, vram_bytes)
+                    # Register model to initialize gauges (queue_depth, active_requests)
+                    prom_collector.register_model(model_alias)
+                    # Update loaded models count
+                    loaded_count = sum(
+                        1 for r in self.active_runners.values() if r.status == "ready")
+                    prom_collector.set_models_loaded_count(loaded_count)
 
                 return runner
 
@@ -678,8 +726,13 @@ class ModelManager:
                         "attempts": attempt + 1
                     }
 
-                    # Malaz bikin komentar jir, intinya jika error / failed, panggil fungsi yang failed
+                    # Track VRAM load failed
                     await self.vram_tracker.track_model_load_failed(model_alias, error_msg)
+
+                    # Track to Prometheus metrics
+                    prom_collector = get_prometheus_collector()
+                    if prom_collector:
+                        prom_collector.record_model_load_failed(model_alias)
 
                     # Cleanup
                     async with self.lock:
@@ -718,15 +771,17 @@ class ModelManager:
                 logger.info(
                     f"[{model_alias}] Retry {attempt + 1}/{max_retries}...")
 
+                # CRITICAL FIX: Release load_lock before retry to prevent deadlock
+                # The lock will be re-acquired at the start of the next retry attempt
+                await self.vram_tracker.track_model_load_failed(
+                    model_alias, f"Retry attempt {attempt + 1} - releasing lock"
+                )
+
                 # Wait before retry (with shutdown check)
                 for _ in range(4):  # 2 seconds total, check every 0.5s
                     if self.shutdown_event.is_set():
                         logger.warning(
                             f"[{model_alias}] Aborting retry due to shutdown")
-
-                        await self.vram_tracker.track_model_load_failed(
-                            model_alias, "Server shutting down during retry"
-                        )
 
                         async with self.lock:
                             if model_alias in self.active_runners:
@@ -735,6 +790,9 @@ class ModelManager:
                                 del self.active_runners[model_alias]
                         raise RuntimeError("Server shutting down")
                     await asyncio.sleep(0.5)
+
+                # Re-acquire load_lock for retry attempt
+                await self.vram_tracker.track_model_load_start(model_alias, runner.port)
 
                 # Reset runner for retry
                 runner.status = "starting"
@@ -756,6 +814,15 @@ class ModelManager:
 
                 # Notify VRAM Tracker tentang eject
                 await self.vram_tracker.track_model_eject(model_alias)
+
+                # Track to Prometheus metrics
+                prom_collector = get_prometheus_collector()
+                if prom_collector:
+                    prom_collector.record_model_eject(model_alias)
+                    # Update loaded models count
+                    loaded_count = sum(
+                        1 for r in self.active_runners.values() if r.status == "ready")
+                    prom_collector.set_models_loaded_count(loaded_count)
 
                 logger.info(
                     f"[{model_alias}] Berhasil di-eject. Port {port} dikembalikan ke pool.")

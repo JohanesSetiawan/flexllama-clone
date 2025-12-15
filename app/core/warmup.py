@@ -140,7 +140,16 @@ class ModelWarmupManager:
                 f"[Preload] [{index}/{total}] ERROR | Model '{model_alias}': {e}")
             return False
 
-    async def preload_models_parallel(self, max_parallel: int = 2):
+    async def preload_models_queued(self, max_parallel: int = 2):
+        """
+        Preload models with queued loading.
+
+        Note: Due to load_lock in VRAMTracker, models load sequentially even when
+        multiple tasks are created. This prevents VRAM race conditions but means
+        max_parallel is effectively a batch size for logging purposes.
+
+        VRAM checking is handled by manager.get_runner_for_request, not here.
+        """
         models_to_preload = self._resolve_preload_models()
 
         if not models_to_preload:
@@ -152,11 +161,11 @@ class ModelWarmupManager:
         preload_delay = self.config.system.preload_delay_sec
 
         logger.info(
-            f"[Preload] Starting preload PARALLEL for {total_models} models: {models_to_preload}"
+            f"[Preload] Starting preload QUEUED for {total_models} models: {models_to_preload}"
         )
 
         logger.info(
-            f"[Preload] System max_concurrent_models={max_concurrent} | Preload max_parallel={max_parallel} | Preload delay between batches={preload_delay}s"
+            f"[Preload] System max_concurrent_models={max_concurrent} | Batch size={max_parallel} | Delay between batches={preload_delay}s"
         )
 
         successful_loads = 0
@@ -172,33 +181,13 @@ class ModelWarmupManager:
             batch = models_to_preload[batch_start:batch_end]
 
             logger.info(
-                f"[Preload] Batch {batch_start//max_parallel + 1}: Loading {len(batch)} models in parallel: {batch}"
+                f"[Preload] Batch {batch_start//max_parallel + 1}: Queuing {len(batch)} models: {batch}"
             )
 
-            vram_report = self.manager.vram_tracker.get_vram_report()
-            free_vram_mb = vram_report["estimated_free_for_new_model_mb"]
-            min_vram_required = self.config.system.min_vram_required
+            # VRAM check is handled by manager.get_runner_for_request
+            # No duplicate check needed here - manager will reject if VRAM insufficient
 
-            if free_vram_mb < min_vram_required:
-                logger.error(
-                    f"[Preload] Free VRAM: {free_vram_mb:.0f} MB (< {min_vram_required} MB required) | [Preload] Successfully loaded: {successful_loads}/{total_models} models"
-                )
-
-                remaining = models_to_preload[batch_start:]
-                skipped_loads = len(remaining)
-
-                # Tandai semua remaining models sebagai VRAM-failed
-                for skipped_model in remaining:
-                    self.vram_failed_models.add(skipped_model)
-
-                logger.warning(
-                    f"[Preload] Skipped models due to insufficient VRAM: {remaining}"
-                )
-
-                # STOP preload completely
-                break
-
-            # Load batch in parallel
+            # Create tasks for batch (they will be processed sequentially due to load_lock)
             load_tasks = []
             for model_alias in batch:
                 task = asyncio.create_task(self._load_single_model(
@@ -219,6 +208,8 @@ class ModelWarmupManager:
                     error_str = str(result).lower()
                     if "vram" in error_str or "insufficient" in error_str:
                         self.vram_failed_models.add(model_alias)
+                        skipped_loads += 1
+                        failed_loads -= 1  # Don't double count
                 elif result:
                     successful_loads += 1
                 else:
@@ -238,7 +229,7 @@ class ModelWarmupManager:
 
         # Summary
         logger.info(
-            f"[Preload] YEAYYYY | Total: {total_models} | Success: {successful_loads} | Failed: {failed_loads} | Skipped: {skipped_loads}"
+            f"[Preload] COMPLETE | Total: {total_models} | Success: {successful_loads} | Failed: {failed_loads} | VRAM-skipped: {skipped_loads}"
         )
 
         # Log final VRAM report
@@ -281,28 +272,11 @@ class ModelWarmupManager:
                 logger.info("[Preload] Shutdown detected. Stopping preload.")
                 return
 
-            # Check VRAM
-            vram_report = self.manager.vram_tracker.get_vram_report()
-            free_vram_mb = vram_report["estimated_free_for_new_model_mb"]
-            min_required = self.config.system.min_vram_required
-
-            if free_vram_mb < min_required:
-                logger.error(
-                    f"[Preload] Insufficient VRAM: {free_vram_mb:.0f} MB < {min_required} MB"
-                )
-
-                remaining = models_to_preload[idx-1:]
-                skipped_loads = len(remaining)
-
-                for skipped_model in remaining:
-                    self.vram_failed_models.add(skipped_model)
-
-                logger.warning(f"[Preload] Skipped models: {remaining}")
-                break
-
-            # Log VRAM status
+            # VRAM check is handled by manager.get_runner_for_request
+            # No duplicate check needed here - manager will reject if VRAM insufficient
+            # Log progress
             logger.info(
-                f"[Preload] [{idx}/{total_models}] Free VRAM: {free_vram_mb:.0f} MB | Loading: {model_alias}"
+                f"[Preload] [{idx}/{total_models}] Loading: {model_alias}"
             )
 
             # Load model
@@ -387,61 +361,69 @@ class ModelWarmupManager:
                         return
 
                     try:
+                        # CRITICAL FIX: Check state inside lock, but perform loading OUTSIDE
+                        # to prevent deadlock (get_runner_for_request also acquires manager.lock)
+                        need_reload = False
+                        need_preload = False
+
                         async with self.manager.lock:
                             if model_alias in self.manager.active_runners:
                                 runner = self.manager.active_runners[model_alias]
                                 if runner.is_alive():
-
                                     # Update last_used_time untuk prevent idle timeout
                                     runner.last_used_time = time.time()
                                     logger.debug(
                                         f"Keeping model '{model_alias}' warm")
                                 else:
-                                    # Runner died, preload again
+                                    # Runner died, mark for reload
+                                    need_reload = True
                                     logger.info(
-                                        f"Re-preloading dead runner: {model_alias}")
-
-                                    # Preload dengan error handling yang lebih baik
-                                    try:
-                                        await asyncio.wait_for(
-                                            self.manager.get_runner_for_request(
-                                                model_alias),
-                                            timeout=120.0
-                                        )
-                                        logger.info(
-                                            f"Successfully re-preloaded '{model_alias}'")
-                                    except asyncio.TimeoutError:
-                                        logger.error(
-                                            f"Timeout re-preloading '{model_alias}'. Skipping for this cycle."
-                                        )
-                                        # Don't retry immediately, wait for next cycle
-                                        continue
+                                        f"Dead runner detected: {model_alias}, will re-preload")
                             else:
                                 # Model tidak running, cek apakah worth preloading
                                 time_since_last_request = time.time() - self.last_request_time.get(model_alias, 0)
 
                                 if time_since_last_request < self.config.system.idle_timeout_sec:
-                                    # Hanya preload jika belum melewati idle timeout
-                                    logger.info(
-                                        f"Preloading popular model: {model_alias}")
-
-                                    try:
-                                        await asyncio.wait_for(
-                                            self.manager.get_runner_for_request(
-                                                model_alias),
-                                            timeout=120.0
-                                        )
-                                        logger.info(
-                                            f"Successfully preloaded '{model_alias}'")
-                                    except asyncio.TimeoutError:
-                                        logger.error(
-                                            f"Timeout preloading '{model_alias}'. Skipping for this cycle."
-                                        )
-                                        continue
+                                    need_preload = True
                                 else:
                                     logger.debug(
                                         f"Skipping preload for '{model_alias}' | Last request was {time_since_last_request:.0f}s ago | (exceeds idle timeout of {self.config.system.idle_timeout_sec}s)"
                                     )
+
+                        # Perform loading OUTSIDE of lock to prevent deadlock
+                        if need_reload:
+                            logger.info(
+                                f"Re-preloading dead runner: {model_alias}")
+                            try:
+                                await asyncio.wait_for(
+                                    self.manager.get_runner_for_request(
+                                        model_alias),
+                                    timeout=120.0
+                                )
+                                logger.info(
+                                    f"Successfully re-preloaded '{model_alias}'")
+                            except asyncio.TimeoutError:
+                                logger.error(
+                                    f"Timeout re-preloading '{model_alias}'. Skipping for this cycle."
+                                )
+                                continue
+
+                        if need_preload:
+                            logger.info(
+                                f"Preloading popular model: {model_alias}")
+                            try:
+                                await asyncio.wait_for(
+                                    self.manager.get_runner_for_request(
+                                        model_alias),
+                                    timeout=120.0
+                                )
+                                logger.info(
+                                    f"Successfully preloaded '{model_alias}'")
+                            except asyncio.TimeoutError:
+                                logger.error(
+                                    f"Timeout preloading '{model_alias}'. Skipping for this cycle."
+                                )
+                                continue
 
                     except asyncio.TimeoutError:
                         logger.error(
@@ -464,11 +446,11 @@ class ModelWarmupManager:
         use_parallel = max_concurrent > 1 and self.config.system.use_mmap
 
         if use_parallel:
-            # Load up to 2 models in parallel (conservative for VRAM safety)
-            parallel_count = min(2, max_concurrent)
+            # Use queued loading (sequential due to load_lock, but tasks created in batches)
+            batch_size = min(2, max_concurrent)
             logger.info(
-                f"[Preload] Using PARALLEL loading (max {parallel_count} at once)")
-            await self.preload_models_parallel(max_parallel=parallel_count)
+                f"[Preload] Using QUEUED loading (batch size {batch_size})")
+            await self.preload_models_queued(max_parallel=batch_size)
         else:
             # Fallback to serial loading
             logger.info("[Preload] Using SERIAL loading")
