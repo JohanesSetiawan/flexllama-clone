@@ -208,8 +208,16 @@ cp .example.config.json config.json
 
 ### Starting the Server
 
+**Original version (main branch):**
+
 ```bash
 python run.py
+```
+
+**Refactored version (refactor branch):**
+
+```bash
+python run_refactor.py
 ```
 
 The server starts on the configured host:port (default: `http://0.0.0.0:8000`).
@@ -430,6 +438,8 @@ eventSource.addEventListener("model_update", (e) => {
 
 ## Project Structure
 
+### Original Structure (app/)
+
 ```
 .
 ├── app/
@@ -443,14 +453,45 @@ eventSource.addEventListener("model_update", (e) => {
 │   │   ├── prometheus_metrics.py  # Metrics collection
 │   │   └── ...
 │   └── main.py                # FastAPI application
-├── monitoring/
-│   ├── prometheus.yml         # Prometheus scrape config
-│   └── grafana/
-│       └── provisioning/      # Grafana datasources & dashboards
-├── .example.config.json       # Example configuration
-├── docker-compose.monitoring.yml  # Prometheus + Grafana
-├── requirements.txt           # Python dependencies
 ├── run.py                     # Server entry point
+└── ...
+```
+
+### Refactored Structure (app_refactor/)
+
+```
+.
+├── app_refactor/
+│   ├── controllers/           # HTTP endpoints (MVC pattern)
+│   │   ├── health_controller.py
+│   │   ├── inference_controller.py
+│   │   ├── model_controller.py
+│   │   ├── status_controller.py
+│   │   └── vram_controller.py
+│   ├── services/              # Business logic (Service layer)
+│   │   ├── proxy_service.py
+│   │   ├── embeddings_service.py
+│   │   ├── health_service.py
+│   │   ├── warmup_service.py
+│   │   ├── vram_service.py
+│   │   ├── telemetry_service.py
+│   │   └── metrics_service.py
+│   ├── core/                  # Core infrastructure
+│   ├── lifecycle/             # Startup/Shutdown management
+│   ├── schemas/               # Pydantic models
+│   ├── middlewares/           # HTTP middlewares
+│   ├── tasks/                 # Background tasks
+│   ├── utils/                 # Utilities
+│   ├── routes.py              # Centralized route registry
+│   ├── main.py                # FastAPI application factory
+│   └── status_server.py       # Lightweight status server (aiohttp)
+├── run_refactor.py            # Refactored entry point
+├── monitoring/
+│   ├── prometheus.yml
+│   └── grafana/
+├── .example.config.json
+├── docker-compose.monitoring.yml
+├── requirements.txt
 └── README.md
 ```
 

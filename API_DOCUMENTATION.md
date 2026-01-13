@@ -1,8 +1,8 @@
 # RouterModelCustom API Documentation
 
-> **Version:** 1.0.0  
+> **Version:** 2.0.0 (Refactored)  
 > **Base URL:** `http://localhost:8000`  
-> **Last Updated:** December 2025
+> **Last Updated:** January 2026
 
 ---
 
@@ -25,6 +25,8 @@
   - [GET /v1/models/status/stream](#get-v1modelsstatusstream)
 - [Health & Monitoring](#health--monitoring)
   - [GET /health](#get-health)
+  - [GET /ready](#get-ready)
+  - [GET /live](#get-live)
   - [GET /metrics](#get-metrics)
   - [GET /metrics/stream](#get-metricsstream)
   - [GET /metrics/report](#get-metricsreport)
@@ -637,6 +639,54 @@ curl http://localhost:8000/health
       "status": "ok"
     }
   }
+}
+```
+
+---
+
+### GET /ready
+
+Kubernetes readiness probe. Returns 200 OK when the application is ready to serve traffic.
+
+#### Request Example
+
+```bash
+curl http://localhost:8000/ready
+```
+
+#### Response (Ready)
+
+```json
+{
+  "status": "ready"
+}
+```
+
+#### Response (Not Ready)
+
+```json
+{
+  "status": "not_ready"
+}
+```
+
+---
+
+### GET /live
+
+Kubernetes liveness probe. Returns 200 OK as long as the server process is running.
+
+#### Request Example
+
+```bash
+curl http://localhost:8000/live
+```
+
+#### Response
+
+```json
+{
+  "status": "alive"
 }
 ```
 
