@@ -229,3 +229,6 @@ config.json
 configOriginal.json
 model_status.json
 benchmark_router.py
+# Legacy code (ignored in refactor branch)
+app/
+run.py
