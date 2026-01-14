@@ -8,3 +8,5 @@ rich
 tabulate
 prometheus-client
 psutil
+slowapi
+redis

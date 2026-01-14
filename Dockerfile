@@ -26,10 +26,9 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN /venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# Copy codebase (TANPA config.json dan models - di-mount dari luar)
+# Copy codebase (refactor branch structure)
 COPY *.py .
-COPY app/ app/
-COPY run.py .
+COPY app_refactor/ app_refactor/
 
 # Set ENV untuk llama-server path
 ENV LLAMA_SERVER_PATH=/app/llama-server
@@ -43,5 +42,5 @@ EXPOSE 8000
 # ENTRYPOINT set ke venv
 ENTRYPOINT ["/venv/bin/python"]
 
-# Command run (jalankan run.py)
-CMD ["run.py"]
+# Command run (jalankan run_refactor.py)
+CMD ["run_refactor.py"]

@@ -35,6 +35,26 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 logger = logging.getLogger(__name__)
 
 
+class RateLimitConfig(BaseModel):
+    """
+    Rate limiting configuration.
+
+    When present, enables request rate limiting using Redis backend.
+    If not configured, rate limiting is disabled.
+    """
+
+    requests_per_minute: int = Field(
+        default=60,
+        ge=1,
+        le=10000,
+        description="Maximum requests per minute"
+    )
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis connection URL for rate limit storage"
+    )
+
+
 class ApiConfig(BaseModel):
     """
     API server configuration.
@@ -43,6 +63,7 @@ class ApiConfig(BaseModel):
         host: IP address to bind (0.0.0.0 for all interfaces)
         port: Port number (1024-65535)
         cors_origins: List of allowed CORS origins
+        rate_limit: Optional rate limiting config (None = disabled)
     """
 
     host: str = Field(
@@ -58,6 +79,10 @@ class ApiConfig(BaseModel):
     cors_origins: List[str] = Field(
         default=["http://localhost:3000"],
         description="Allowed origins for CORS"
+    )
+    rate_limit: Optional[RateLimitConfig] = Field(
+        default=None,
+        description="Rate limiting config (None = disabled)"
     )
 
 

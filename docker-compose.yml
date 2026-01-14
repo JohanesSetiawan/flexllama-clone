@@ -1,0 +1,57 @@
+# Docker Compose for Router Model API + Redis
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down
+#
+# Environment variables loaded from .env file
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: router_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - router
+
+  router-api:
+    build: .
+    container_name: router_api
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - API_KEY=${API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - CONFIG_PATH=/app/config.json
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ${MODELS_PATH:-./models}:/app/models:ro
+    networks:
+      - router
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  redis_data:
+
+networks:
+  router:
+    driver: bridge
