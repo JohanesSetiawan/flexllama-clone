@@ -19,7 +19,7 @@ router = APIRouter(tags=["Inference"])
 
 
 @router.post(
-    "/v1/chat/completions",
+    "/chat/completions",
     # Proxy service returns Response object directly (streaming or JSON)
     response_model=None,
     summary="Create chat completion"
@@ -45,7 +45,7 @@ async def chat_completions(
 
 
 @router.post(
-    "/v1/embeddings",
+    "/embeddings",
     response_model=EmbeddingResponse,
     summary="Create embeddings"
 )

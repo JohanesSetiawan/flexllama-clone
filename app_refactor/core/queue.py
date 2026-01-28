@@ -251,22 +251,31 @@ class QueueManager:
     Manager for all model request queues.
 
     Maintains one queue per model, creating queues on demand.
+    Supports Redis-backed queue when enabled, with in-memory fallback.
 
     Attributes:
         config: Application configuration
-        queues: Dictionary of model alias to queue
+        queues: Dictionary of model alias to in-memory queue
+        redis_queue: Optional Redis queue service
     """
 
-    def __init__(self, config):
+    def __init__(self, config, redis_queue_service=None):
         """
         Initialize the queue manager.
 
         Args:
             config: Application configuration with queue settings
+            redis_queue_service: Optional Redis queue service for persistence
         """
         self.config = config
         self.queues: Dict[str, ModelRequestQueue] = {}
         self.lock = asyncio.Lock()
+        self.redis_queue = redis_queue_service
+
+    @property
+    def use_redis(self) -> bool:
+        """Check if Redis queue is enabled and connected."""
+        return self.redis_queue is not None and self.redis_queue.connected
 
     async def get_queue(self, model_alias: str) -> ModelRequestQueue:
         """
@@ -287,6 +296,71 @@ class QueueManager:
                 )
             return self.queues[model_alias]
 
+    async def enqueue_redis(
+        self,
+        model_alias: str,
+        request_id: str,
+        body: Dict[str, Any],
+        priority: RequestPriority = RequestPriority.NORMAL
+    ) -> bool:
+        """
+        Enqueue request to Redis (if enabled).
+
+        Args:
+            model_alias: Target model
+            request_id: Unique request ID
+            body: Request payload
+            priority: Request priority
+
+        Returns:
+            True if enqueued to Redis, False if using in-memory
+        """
+        if not self.use_redis:
+            return False
+
+        max_size = self.config.system.max_queue_size_per_model
+        await self.redis_queue.enqueue(
+            model_alias=model_alias,
+            request_id=request_id,
+            body=body,
+            priority=priority.value,
+            max_queue_size=max_size
+        )
+        return True
+
+    async def dequeue_redis(self, model_alias: str) -> Optional[Dict[str, Any]]:
+        """
+        Dequeue request from Redis (if enabled).
+
+        Args:
+            model_alias: Target model
+
+        Returns:
+            Request data dict, or None if empty/not using Redis
+        """
+        if not self.use_redis:
+            return None
+
+        return await self.redis_queue.dequeue(model_alias)
+
+    async def set_result_redis(
+        self,
+        request_id: str,
+        result: Dict[str, Any]
+    ) -> bool:
+        """Store result in Redis for polling."""
+        if not self.use_redis:
+            return False
+
+        return await self.redis_queue.set_result(request_id, result)
+
+    async def get_result_redis(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Get result from Redis."""
+        if not self.use_redis:
+            return None
+
+        return await self.redis_queue.get_result(request_id)
+
     def get_all_stats(self) -> Dict[str, Dict[str, Any]]:
         """
         Get statistics for all queues.
@@ -294,10 +368,12 @@ class QueueManager:
         Returns:
             Dictionary mapping model alias to queue statistics
         """
-        return {
+        stats = {
             alias: queue.get_stats()
             for alias, queue in self.queues.items()
         }
+        stats["_redis_enabled"] = self.use_redis
+        return stats
 
     def get_total_pending(self) -> int:
         """

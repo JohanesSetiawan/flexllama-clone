@@ -31,6 +31,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     Validates Authorization header against API_KEY from environment.
     Public paths (docs, health) bypass authentication.
+    Non-existent routes bypass auth to return proper 404.
     """
 
     def __init__(self, app, api_key: str | None = None):
@@ -42,10 +43,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
             api_key: API key to validate against (defaults to API_KEY env var)
         """
         super().__init__(app)
+        self.app = app
         self.api_key = api_key or os.getenv("API_KEY", "")
+        self.auth_enabled = bool(self.api_key)
 
-        if not self.api_key:
-            logger.warning("API_KEY not set. All requests will be rejected.")
+        if not self.auth_enabled:
+            logger.info("API_KEY not set. Authentication DISABLED.")
+        else:
+            logger.info("API_KEY configured. Authentication ENABLED.")
 
     async def dispatch(
         self,
@@ -54,8 +59,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
     ) -> JSONResponse:
         """Process request and validate authentication."""
 
+        # Skip auth entirely if not configured
+        if not self.auth_enabled:
+            return await call_next(request)
+
         # Skip auth for public paths
         if self._is_public_path(request.url.path):
+            return await call_next(request)
+
+        # Skip auth for non-existent routes (let them return 404)
+        if not self._route_exists(request):
             return await call_next(request)
 
         # Validate Bearer token
@@ -67,6 +80,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
     def _is_public_path(self, path: str) -> bool:
         """Check if path is public (no auth required)."""
         return path in PUBLIC_PATHS
+
+    def _route_exists(self, request: Request) -> bool:
+        """Check if the requested route exists in the app."""
+        try:
+            # Get the router from app
+            app = request.app
+            for route in app.routes:
+                match, _ = route.matches(request.scope)
+                if match.value > 0:  # Match.FULL or Match.PARTIAL
+                    return True
+            return False
+        except Exception:
+            # If check fails, assume route exists and require auth
+            return True
 
     def _validate_token(self, request: Request) -> bool:
         """

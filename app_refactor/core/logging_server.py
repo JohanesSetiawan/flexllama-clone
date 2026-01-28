@@ -87,16 +87,30 @@ class StructuredFormatter(logging.Formatter):
 
 class SimpleFormatter(logging.Formatter):
     """
-    Simple human-readable log formatter.
+    Simple human-readable log formatter with milliseconds.
 
-    Format: TIMESTAMP - LOGGER - LEVEL - MESSAGE
+    Format: [TIMESTAMP.mmm] LEVEL:LOGGER:MESSAGE
     """
 
     def __init__(self):
         super().__init__(
-            fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            fmt="[%(asctime)s] %(levelname)s:%(name)s:%(message)s",
             datefmt="%Y-%m-%d %H:%M:%S"
         )
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str = None) -> str:
+        """
+        Override formatTime to include milliseconds.
+
+        Returns timestamp in format: YYYY-MM-DD HH:MM:SS.mmm
+        """
+        ct = datetime.fromtimestamp(record.created)
+        if datefmt:
+            s = ct.strftime(datefmt)
+        else:
+            s = ct.strftime("%Y-%m-%d %H:%M:%S")
+        # Add milliseconds
+        return f"{s}.{int(record.msecs):03d}"
 
 
 def setup_logging(

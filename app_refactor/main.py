@@ -10,12 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .core.config import AppConfig
 from .routes import api_router
-from .lifecycle.startup import app_startup
-from .lifecycle.shutdown import app_shutdown
+from .lifecycle.startup import startup_handler
+from .lifecycle.shutdown import shutdown_handler
 from .lifecycle.dependencies import get_container, set_container, AppContainer
 
 from .middlewares.limit_request import RequestSizeLimitMiddleware
-from .middlewares.request_tracker import RequestTracker
+from .middlewares.request_tracker import RequestTrackerMiddleware
 from .middlewares.telemetry_middleware import TelemetryMiddleware
 from .middlewares.metrics_middleware import MetricsMiddleware
 from .middlewares.auth import AuthMiddleware
@@ -37,7 +37,7 @@ def create_app(config: AppConfig) -> FastAPI:
     """
     app = FastAPI(
         title="Router Model API",
-        version="1.0.0",
+        version="2.0.0",
         description="High-performance LLM Router and Gateway",
         docs_url="/docs",
         redoc_url="/redoc"
@@ -72,21 +72,26 @@ def create_app(config: AppConfig) -> FastAPI:
         max_size=10 * 1024 * 1024  # 10MB
     )
 
-    # 5. Telemetry (Detailed tracking)
+    # 3. Telemetry (Detailed tracking)
     app.add_middleware(TelemetryMiddleware)
 
-    # 6. Metrics (Simple counters)
+    # 4. Metrics (Simple counters)
     app.add_middleware(MetricsMiddleware)
 
-    # 7. Request Tracker (Active request count for graceful shutdown)
-    app.add_middleware(RequestTracker)
+    # 5. Request Tracker (Active request count for graceful shutdown)
+    app.add_middleware(RequestTrackerMiddleware)
 
     # Include Routes
     app.include_router(api_router)
 
     # Lifecycle Events
-    app.add_event_handler("startup", lambda: app_startup(container))
-    app.add_event_handler("shutdown", lambda: app_shutdown(container))
+    @app.on_event("startup")
+    async def on_startup():
+        await startup_handler()
+
+    @app.on_event("shutdown")
+    async def on_shutdown():
+        await shutdown_handler()
 
     logger.info("FastAPI application created")
     return app

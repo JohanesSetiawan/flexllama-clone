@@ -175,32 +175,124 @@ cp .example.config.json config.json
   },
   "system": {
     "llama_server_path": "/path/to/llama-server",
+    "base_models_path": "/path/to/models",
     "max_concurrent_models": 3,
     "preload_models": ["*"],
     "enable_idle_timeout": false,
     "gpu_devices": [0],
-    "flash_attention": "on"
+    "default_parallel": 1
   },
   "models": {
     "qwen-7b": {
-      "model_path": "/path/to/models/qwen-7b.gguf",
-      "params": {
-        "n_gpu_layers": 99,
-        "n_ctx": 8192
-      }
+      "model_path": "qwen-7b.gguf",
+      "flags": [
+        "-ngl",
+        "99",
+        "--ctx-size",
+        "8192",
+        "--flash-attn",
+        "on",
+        "--mlock",
+        "--jinja"
+      ]
     },
     "llama-3b": {
-      "model_path": "/path/to/models/llama-3b.gguf",
-      "params": {
-        "n_gpu_layers": 99,
-        "n_ctx": 4096
-      }
+      "model_path": "llama-3b.gguf",
+      "flags": [
+        "-ngl",
+        "80",
+        "--ctx-size",
+        "4096",
+        "--cache-type-k",
+        "q4_0",
+        "--cache-type-v",
+        "q4_0",
+        "--flash-attn",
+        "on"
+      ]
+    },
+    "embedding-model": {
+      "model_path": "embedding.gguf",
+      "flags": ["-ngl", "99", "--ctx-size", "4096", "--embedding"]
     }
   }
 }
 ```
 
-> **TIP:** Use `"preload_models": ["*"]` to load ALL models on startup (ideal for avoiding cold-start latency).
+> **TIP:** Use `"preload_models": ["*"]` to load ALL models on startup. Flags are passed directly to `llama-server` - run `llama-server --help` for all options.
+
+#### 3. (Optional) Enable API Key Authentication
+
+```bash
+cp .env.example .env
+# Edit .env and set API_KEY
+```
+
+If `API_KEY` is set, requests must include `Authorization: Bearer <key>` header.
+
+#### 4. Docker Deployment (Recommended)
+
+**Auto-switching Configuration:**
+
+The application automatically detects the environment and uses the appropriate `llama-server` path:
+
+- **Local Development**: Uses path from `konfig.json` (e.g., `/home/user/llama.cpp/build/bin/llama-server`)
+- **Docker Container**: Automatically uses `/app/llama-server` from the base image
+
+**Build and Run:**
+
+```bash
+# Build Docker image
+docker build -t router-model:latest .
+
+# Run container
+docker run -d \
+  --gpus all \
+  -p 8000:8000 \
+  -v $(pwd)/models:/app/models \
+  -v $(pwd)/config.json:/app/config.json \
+  router-model:latest
+```
+
+**Environment Variable Override:**
+
+You can override the llama-server path at runtime:
+
+```bash
+docker run -d \
+  --gpus all \
+  -p 8000:8000 \
+  -e LLAMA_SERVER_PATH=/custom/path/llama-server \
+  -e BASE_MODELS_PATH=/custom/models \
+  -v $(pwd)/models:/app/models \
+  router-model:latest
+```
+
+**Docker Compose:**
+
+```yaml
+version: '3.8'
+services:
+  router:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - LLAMA_SERVER_PATH=/app/llama-server  # Auto-set by Dockerfile
+      - BASE_MODELS_PATH=/app/models
+    volumes:
+      - ./models:/app/models
+      - ./config.json:/app/config.json
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+
+> **Note**: The Dockerfile uses `ghcr.io/ggml-org/llama.cpp:server-cuda` as base image, which includes `llama-server` at `/app/llama-server`. No manual llama.cpp installation needed!
 
 ---
 
@@ -406,33 +498,70 @@ eventSource.addEventListener("model_update", (e) => {
 
 ## Configuration Reference
 
+### Environment Variables
+
+The application supports environment variable overrides for flexible deployment:
+
+| Variable              | Description                                                                 | Example                              |
+| --------------------- | --------------------------------------------------------------------------- | ------------------------------------ |
+| `LLAMA_SERVER_PATH`   | Override llama-server binary path (takes priority over config file)        | `/app/llama-server`                  |
+| `BASE_MODELS_PATH`    | Override base models directory (takes priority over config file)           | `/app/models`                        |
+| `CONFIG_PATH`         | Override config file path                                                   | `/app/config.json`                   |
+| `API_KEY`             | Enable API key authentication                                               | `your-secret-api-key`                |
+
+**Usage Priority:**
+1. Environment variables (highest priority)
+2. Config file values
+3. Default values (lowest priority)
+
+**Example:**
+```bash
+# Local development - uses konfig.json
+python run_refactor.py
+
+# Docker - ENV variables auto-set
+docker run -e LLAMA_SERVER_PATH=/app/llama-server router-model:latest
+
+# Custom override
+export LLAMA_SERVER_PATH=/custom/path/llama-server
+python run_refactor.py
+```
+
 ### System Configuration (`system`)
 
 | Key                        | Type   | Default | Description                                                                                                             |
 | -------------------------- | ------ | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `llama_server_path`        | string | -       | Absolute path to the `llama-server` executable binary from llama.cpp                                                    |
+| `llama_server_path`        | string | -       | Path to `llama-server` binary. **Priority**: ENV `LLAMA_SERVER_PATH` > config value. Docker auto-sets to `/app/llama-server` |
+| `base_models_path`         | string | -       | Base directory for model files. **Priority**: ENV `BASE_MODELS_PATH` > config value. If set, `model_path` can be relative |
 | `max_concurrent_models`    | int    | 3       | Maximum number of models that can be loaded into VRAM at the same time                                                  |
 | `preload_models`           | list   | `[]`    | List of model aliases to load on startup. Use `["*"]` to preload all models defined in config                           |
 | `enable_idle_timeout`      | bool   | true    | When enabled, automatically unloads models from VRAM after being idle. Set to `false` to keep models loaded permanently |
 | `idle_timeout_sec`         | int    | 300     | Time in seconds a model can remain unused before being unloaded from VRAM                                               |
 | `request_timeout_sec`      | int    | 120     | Maximum time in seconds to wait for a response from llama-server before timing out                                      |
 | `gpu_devices`              | list   | `[0]`   | List of GPU device indices to use for model inference (e.g., `[0]` for first GPU)                                       |
-| `parallel_requests`        | int    | 1       | Number of concurrent requests each model instance can handle simultaneously                                             |
-| `cpu_threads`              | int    | 8       | Number of CPU threads allocated for model operations (prompt processing, non-GPU tasks)                                 |
-| `flash_attention`          | string | `"on"`  | Flash Attention mode for faster inference. Options: `"on"`, `"off"`, or `"auto"`                                        |
+| `default_parallel`         | int    | 1       | Default parallel request slots (override per-model with `--parallel` flag)                                              |
 | `max_queue_size_per_model` | int    | 500     | Maximum number of requests that can wait in queue per model before rejecting new requests                               |
 | `vram_multiplier`          | float  | 1.1     | Multiplier applied to model file size when estimating VRAM requirements (1.1 = 10% buffer)                              |
 
 ### Model Configuration (`models.{alias}`)
 
-| Key                   | Type   | Default  | Description                                                                                           |
-| --------------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
-| `model_path`          | string | Required | Absolute path to the GGUF model file on disk                                                          |
-| `params.n_gpu_layers` | int    | 99       | Number of model layers to offload to GPU. Use `99` to offload all layers, `-1` for CPU-only inference |
-| `params.n_ctx`        | int    | 4096     | Context window size in tokens. Larger values allow longer conversations but use more VRAM             |
-| `params.embedding`    | bool   | false    | Set to `true` for embedding models to enable the `/v1/embeddings` endpoint                            |
-| `params.type_k`       | string | `"f16"`  | Data type for KV cache keys. Options: `"f16"`, `"q8_0"`, `"q4_0"`. Lower precision saves VRAM         |
-| `params.type_v`       | string | `"f16"`  | Data type for KV cache values. Options: `"f16"`, `"q8_0"`, `"q4_0"`. Lower precision saves VRAM       |
+| Key          | Type   | Default  | Description                                                                          |
+| ------------ | ------ | -------- | ------------------------------------------------------------------------------------ |
+| `model_path` | string | Required | Path to GGUF model file (absolute or relative to `base_models_path`)                 |
+| `flags`      | array  | `[]`     | CLI flags passed directly to llama-server. Run `llama-server --help` for all options |
+
+#### Common Flags
+
+| Flag                               | Example                    | Description              |
+| ---------------------------------- | -------------------------- | ------------------------ |
+| `-ngl`, `--n-gpu-layers`           | `"-ngl", "99"`             | GPU layers (99 = all)    |
+| `--ctx-size`, `-c`                 | `"--ctx-size", "4096"`     | Context window size      |
+| `--flash-attn`, `-fa`              | `"--flash-attn", "on"`     | Flash Attention mode     |
+| `--mlock`                          | `"--mlock"`                | Lock model in RAM        |
+| `--embedding`                      | `"--embedding"`            | Enable embedding mode    |
+| `--cache-type-k`, `--cache-type-v` | `"--cache-type-k", "q4_0"` | KV cache quantization    |
+| `--parallel`                       | `"--parallel", "2"`        | Concurrent request slots |
+| `--jinja`                          | `"--jinja"`                | Enable Jinja templates   |
 
 ---
 

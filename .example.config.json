@@ -1,30 +1,32 @@
 {
-    "_README": "=== PANDUAN PATH CONFIGURATION ===",
-    "_README_1": "llama_server_path: Path lengkap ke binary llama-server",
-    "_README_2": "base_models_path: (OPSIONAL) Folder tempat model .gguf disimpan. Jika di-set, model_path bisa relatif.",
-    "_README_3": "model_path: Bisa ABSOLUTE (/full/path/to/model.gguf) atau RELATIVE (cuma nama_file.gguf)",
-    "_README_4": "Contoh 1 - Absolute: llama di /home/user/llama.cpp, models di /mnt/models → set base_models_path kosong, gunakan absolute path",
-    "_README_5": "Contoh 2 - Relative: semua models di satu folder → set base_models_path='/home/user/models', model_path='model.gguf'",
+    "_README": "=== Configuration Guide ===",
+    "_README_1": "llama_server_path: Full path to llama-server binary",
+    "_README_2": "base_models_path: (Optional) Folder for .gguf files. If set, model_path can be relative.",
+    "_README_3": "flags: Array of CLI flags passed directly to llama-server. See llama-server --help for options.",
+    "_README_4": "Example flags: -ngl (GPU layers), --ctx-size (context), --flash-attn, --mlock, --embedding",
 
     "api": {
-        "host": "<IP_ADDRESS>",
-        "port": "<PORT>"
+        "host": "0.0.0.0",
+        "port": 8000,
+        "rate_limit": {
+            "requests_per_minute": "<REQUESTS_PER_MINUTE>",
+            "redis_url": "<REDIS_URL>"
+        },
+        "_comment": "Remove this section to disable rate limiting.",
+        "rate_limit_set_into_turn_off": "null"
     },
     "system": {
         "enable_idle_timeout": false,
-        "idle_timeout_sec": 300,
-        "llama_server_path": "<LLAMA_SERVER_PATH>",
-        "base_models_path": "<BASE_MODELS_PATH>",
+        "idle_timeout_sec": 600,
+        "llama_server_path": "/path/to/llama-server",
+        "base_models_path": "/path/to/models",
         "max_concurrent_models": 10,
         "request_timeout_sec": 120,
         "preload_models": ["*"],
         "preload_delay_sec": 2,
         "keep_warm_models": 2,
         "gpu_devices": [0],
-        "parallel_requests": 1,
-        "cpu_threads": 8,
-        "use_mmap": true,
-        "flash_attention": "on",
+        "default_parallel": 1,
         "max_queue_size_per_model": 500,
         "queue_timeout_sec": 180,
         "min_vram_required": 500,
@@ -36,38 +38,47 @@
         "queue_processor_idle_sec": 120,
         "model_load_max_retries": 2
     },
+    "redis": {
+        "_comment": "Redis config for caching and queue. Remove this section to disable.",
+        "url": "redis://localhost:6379/0",
+        "enable_cache": true,
+        "cache_ttl_sec": 3600,
+        "cache_prefix": "router:cache:",
+        "enable_redis_queue": false,
+        "queue_ttl_sec": 90,
+        "queue_prefix": "router:queue:"
+    },
     "models": {
-        "<ALIAS_MODEL_1>": {
-            "model_path": "<MODEL_FILENAME>",
-            "params": {
-                "n_gpu_layers": 99,
-                "n_ctx": 4096,
-                "embedding": false,
-                "parallel_override": null,
-                "batch_override": null
-            }
+        "model-chat": {
+            "model_path": "model-chat.gguf",
+            "flags": [
+                "-ngl", "99",
+                "--ctx-size", "4096",
+                "--mlock",
+                "--jinja",
+                "--flash-attn", "on"
+            ]
         },
-        "<ALIAS_MODEL_2>": {
-            "model_path": "<MODEL_FILENAME>",
-            "params": {
-                "n_gpu_layers": 99,
-                "n_ctx": 16384,
-                "embedding": false,
-                "parallel_override": null,
-                "batch_override": null,
-                "type_k": "q4_0",
-                "type_v": "q4_0"
-            }
+        "model-large": {
+            "model_path": "model-large.gguf",
+            "flags": [
+                "-ngl", "80",
+                "--ctx-size", "16384",
+                "--cache-type-k", "q4_0",
+                "--cache-type-v", "q4_0",
+                "--mlock",
+                "--jinja",
+                "--flash-attn", "on"
+            ]
         },
-        "<ALIAS_EMBEDDING>": {
-            "model_path": "<EMBEDDING_MODEL_FILENAME>",
-            "params": {
-                "n_gpu_layers": 99,
-                "n_ctx": 4096,
-                "embedding": true,
-                "parallel_override": null,
-                "batch_override": null
-            }
+        "model-embedding": {
+            "model_path": "model-embedding.gguf",
+            "flags": [
+                "-ngl", "99",
+                "--ctx-size", "4096",
+                "--embedding",
+                "--flash-attn", "on"
+            ]
         }
     }
 }

@@ -34,10 +34,12 @@ services:
       - API_KEY=${API_KEY}
       - REDIS_URL=redis://redis:6379/0
       - CONFIG_PATH=/app/config.json
+      - LLAMA_SERVER_PATH=/app/llama-server
+      - BASE_MODELS_PATH=/app/models
     ports:
       - "8000:8000"
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ./konfig.json:/app/config.json:ro
       - ${MODELS_PATH:-./models}:/app/models:ro
     networks:
       - router

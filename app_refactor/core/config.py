@@ -12,8 +12,11 @@ Configuration Sections:
     - AppConfig: Root configuration container
 
 Environment Variables:
-    - LLAMA_SERVER_PATH: Override llama-server binary path
-    - BASE_MODELS_PATH: Override base models directory
+    - LLAMA_SERVER_PATH: Override llama-server binary path (takes priority over config file)
+                         Docker: automatically set to /app/llama-server
+                         Local dev: reads from config file
+    - BASE_MODELS_PATH: Override base models directory (takes priority over config file)
+    - CONFIG_PATH: Override config file path (default: config.json or konfig.json)
 
 Usage:
     from app_refactor.core.config import load_config
@@ -52,6 +55,53 @@ class RateLimitConfig(BaseModel):
     redis_url: str = Field(
         default="redis://localhost:6379/0",
         description="Redis connection URL for rate limit storage"
+    )
+
+
+class RedisConfig(BaseModel):
+    """
+    Redis configuration for caching and queue management.
+
+    Enables semantic caching to reduce GPU load and queue TTL for SLA compliance.
+    If not configured, caching is disabled and in-memory queue is used.
+    """
+
+    # Connection settings
+    url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis connection URL"
+    )
+
+    # Cache settings
+    enable_cache: bool = Field(
+        default=True,
+        description="Enable semantic response caching"
+    )
+    cache_ttl_sec: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="Cache TTL in seconds (default: 1 hour)"
+    )
+    cache_prefix: str = Field(
+        default="router:cache:",
+        description="Redis key prefix for cached responses"
+    )
+
+    # Queue settings
+    enable_redis_queue: bool = Field(
+        default=False,
+        description="Use Redis-backed queue instead of in-memory"
+    )
+    queue_ttl_sec: int = Field(
+        default=90,
+        ge=30,
+        le=300,
+        description="Max time request can wait in queue (default: 90s for 1.5min SLA)"
+    )
+    queue_prefix: str = Field(
+        default="router:queue:",
+        description="Redis key prefix for queue entries"
     )
 
 
@@ -108,11 +158,11 @@ class SystemConfig(BaseModel):
 
     # Server paths
     llama_server_path: str = Field(
-        default=os.getenv("LLAMA_SERVER_PATH", ""),
+        default="",
         description="Absolute path to llama-server binary"
     )
     base_models_path: str = Field(
-        default=os.getenv("BASE_MODELS_PATH", ""),
+        default="",
         description="Base directory for model files"
     )
 
@@ -181,26 +231,12 @@ class SystemConfig(BaseModel):
         description="GPU device indices to use"
     )
 
-    # Performance settings
-    parallel_requests: int = Field(
-        default=4,
+    # Default parallel requests (used if not specified in model flags)
+    default_parallel: int = Field(
+        default=1,
         ge=1,
         le=32,
-        description="Parallel request slots per model"
-    )
-    cpu_threads: int = Field(
-        default=8,
-        ge=1,
-        le=64,
-        description="CPU threads for non-GPU operations"
-    )
-    use_mmap: bool = Field(
-        default=True,
-        description="Use memory mapping for model loading"
-    )
-    flash_attention: str = Field(
-        default="on",
-        description="Flash Attention mode: 'on' or 'off'"
+        description="Default parallel request slots (override per-model with --parallel flag)"
     )
 
     # Queue settings
@@ -253,15 +289,24 @@ class SystemConfig(BaseModel):
     @field_validator("llama_server_path")
     @classmethod
     def validate_llama_server_path(cls, v: str) -> str:
-        """Validate llama-server binary path exists and is executable."""
-        # Environment variable takes precedence
-        env_path = os.getenv("LLAMA_SERVER_PATH", "")
+        """
+        Validate llama-server binary path exists and is executable.
+
+        Priority order:
+        1. LLAMA_SERVER_PATH environment variable (Docker/override)
+        2. Value from config file (local development)
+        """
+        # Environment variable takes precedence (for Docker auto-switch)
+        env_path = os.getenv("LLAMA_SERVER_PATH")
         if env_path:
+            logger.info(f"Using llama-server from ENV: {env_path}")
             v = env_path
+        elif v:
+            logger.info(f"Using llama-server from config: {v}")
 
         if not v:
             raise ValueError(
-                "llama_server_path must be set, or use LLAMA_SERVER_PATH env var"
+                "llama_server_path must be set in config, or use LLAMA_SERVER_PATH env var"
             )
 
         path = Path(v)
@@ -277,11 +322,20 @@ class SystemConfig(BaseModel):
     @field_validator("base_models_path")
     @classmethod
     def validate_base_models_path(cls, v: str) -> str:
-        """Validate base models directory if specified."""
+        """
+        Validate base models directory if specified.
+
+        Priority order:
+        1. BASE_MODELS_PATH environment variable (Docker/override)
+        2. Value from config file (local development)
+        """
         # Environment variable takes precedence
-        env_path = os.getenv("BASE_MODELS_PATH", "")
+        env_path = os.getenv("BASE_MODELS_PATH")
         if env_path:
+            logger.info(f"Using base models path from ENV: {env_path}")
             v = env_path
+        elif v:
+            logger.info(f"Using base models path from config: {v}")
 
         # Optional - if empty, all model_path must be absolute
         if v:
@@ -294,106 +348,75 @@ class SystemConfig(BaseModel):
         return v
 
 
-class ModelParams(BaseModel):
-    """
-    Per-model parameters for llama-server.
-
-    These parameters are passed to llama-server when the model is loaded.
-    Each model can have different configuration according to its needs.
-    """
-
-    n_gpu_layers: int = Field(
-        default=99,
-        ge=-1,
-        description="Number of model layers to load on GPU"
-    )
-    n_ctx: int = Field(
-        default=4096,
-        ge=512,
-        le=131072,
-        description="Context window size (tokens)"
-    )
-    n_batch: int = Field(
-        default=256,
-        ge=128,
-        le=512,
-        description="Batch size for prompt processing"
-    )
-    rope_freq_base: Optional[int] = Field(
-        default=None,
-        ge=0,
-        description="RoPE frequency base for extended context"
-    )
-    embedding: bool = Field(
-        default=False,
-        description="Enable embedding mode"
-    )
-    chat_template: Optional[str] = Field(
-        default=None,
-        description="Override chat template"
-    )
-    parallel_override: Optional[int] = Field(
-        default=None,
-        ge=1,
-        le=32,
-        description="Override parallel requests for this model"
-    )
-    batch_override: Optional[int] = Field(
-        default=None,
-        ge=128,
-        le=4096,
-        description="Override batch size for this model"
-    )
-    type_k: Optional[str] = Field(
-        default="f16",
-        description="KV cache key type (f16, q8_0, q4_0, etc.)"
-    )
-    type_v: Optional[str] = Field(
-        default="f16",
-        description="KV cache value type (f16, q8_0, q4_0, etc.)"
-    )
-
-    @field_validator("type_k", "type_v")
-    @classmethod
-    def validate_cache_type(cls, v: Optional[str]) -> Optional[str]:
-        """Validate KV cache type is supported."""
-        if v is None or v == "":
-            return "f16"
-
-        valid_types = [
-            "f16", "f32", "bf16", "q8_0",
-            "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"
-        ]
-        if v not in valid_types:
-            raise ValueError(
-                f"Cache type must be one of: {', '.join(valid_types)}"
-            )
-        return v
-
-
 class ModelConfig(BaseModel):
     """
     Configuration for a single model.
 
-    Each model has its own file path and specific parameters.
-    Models are identified by their alias (key in models dict).
+    Uses flexible flags array that gets passed directly to llama-server.
+    This allows full customization without codebase changes.
 
     Attributes:
         model_path: Path to .gguf model file
-        params: Model-specific parameters
+        flags: CLI flags to pass to llama-server
     """
 
     model_path: str = Field(
         ...,
         description="Path to model .gguf file"
     )
-    params: ModelParams = Field(
-        default_factory=ModelParams,
-        description="Model-specific parameters"
+    flags: List[str] = Field(
+        default_factory=list,
+        description="CLI flags for llama-server (e.g., ['--ngl', '99', '--ctx-size', '4096'])"
     )
 
     # Internal field for resolved absolute path
     _resolved_path: Optional[str] = None
+
+    def get_flag_value(self, flag_name: str, default: str = None) -> Optional[str]:
+        """
+        Get value for a specific flag from flags list.
+
+        Args:
+            flag_name: Flag name (e.g., '--ctx-size', '-c')
+            default: Default value if flag not found
+
+        Returns:
+            Flag value or default
+        """
+        try:
+            idx = self.flags.index(flag_name)
+            if idx + 1 < len(self.flags):
+                return self.flags[idx + 1]
+        except ValueError:
+            pass
+        return default
+
+    def get_ctx_size(self) -> int:
+        """Get context size from flags (for VRAM estimation)."""
+        for flag in ["--ctx-size", "-c"]:
+            val = self.get_flag_value(flag)
+            if val:
+                return int(val)
+        return 4096  # Default
+
+    def get_n_gpu_layers(self) -> int:
+        """Get GPU layers from flags (for VRAM estimation)."""
+        for flag in ["--n-gpu-layers", "--ngl", "-ngl"]:
+            val = self.get_flag_value(flag)
+            if val:
+                return int(val)
+        return 99  # Default (all layers)
+
+    def is_embedding_mode(self) -> bool:
+        """Check if embedding mode is enabled."""
+        return "--embedding" in self.flags
+
+    def get_parallel(self, system_default: int = 4) -> int:
+        """Get parallel requests setting."""
+        val = self.get_flag_value("--parallel")
+        if val:
+            return int(val)
+        return system_default
 
     def resolve_path(self, base_models_path: str) -> str:
         """
@@ -464,6 +487,10 @@ class AppConfig(BaseModel):
 
     api: ApiConfig
     system: SystemConfig
+    redis: Optional[RedisConfig] = Field(
+        default=None,
+        description="Redis config for caching/queuing (None = disabled)"
+    )
     models: Dict[str, ModelConfig]
 
     @field_validator("models")
@@ -494,12 +521,13 @@ class AppConfig(BaseModel):
         return self
 
 
-def load_config(path: str) -> AppConfig:
+def load_config(path: Optional[str] = None) -> AppConfig:
     """
     Load and validate configuration from JSON file.
 
     Args:
-        path: Path to config.json file
+        path: Path to config.json file. If None, uses CONFIG_PATH env var
+              or defaults to 'config.json' in working directory.
 
     Returns:
         Validated AppConfig instance
@@ -509,6 +537,10 @@ def load_config(path: str) -> AppConfig:
         ValueError: If JSON is invalid or validation fails
         RuntimeError: If other error occurs
     """
+    # Fallback to env var or default
+    if path is None:
+        path = os.getenv("CONFIG_PATH", "config.json")
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)

@@ -142,3 +142,157 @@ async def eject_model(
         )
 
     return {"status": "success", "message": f"Model '{request.model}' ejected"}
+
+
+@router.get(
+    "/models/{model_alias}/status",
+    summary="Get model loading status"
+)
+async def get_model_loading_status(
+    model_alias: str,
+    manager: ModelManager = Depends(get_manager)
+):
+    """
+    Get detailed loading status for a specific model.
+
+    Args:
+        model_alias: The model alias to check.
+
+    Returns:
+        Model loading status with progress details.
+    """
+    if not manager:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model manager not available"
+        )
+
+    try:
+        status_info = await manager.get_model_status(model_alias)
+        return {"model": model_alias, **status_info}
+    except LookupError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+
+
+@router.post(
+    "/models/{model_alias}/reset",
+    summary="Reset failed model status"
+)
+async def reset_model_failure(
+    model_alias: str,
+    manager: ModelManager = Depends(get_manager)
+):
+    """
+    Reset failed model status to allow retry.
+
+    Useful when you've fixed configuration and want to retry loading.
+
+    Args:
+        model_alias: The model alias to reset.
+    """
+    if not manager:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model manager not available"
+        )
+
+    async with manager.lock:
+        if model_alias in manager.failed_models:
+            failed_info = manager.failed_models[model_alias]
+            del manager.failed_models[model_alias]
+
+            return {
+                "status": "success",
+                "model": model_alias,
+                "message": f"Model failure status cleared. Had {failed_info['attempts']} failed attempts.",
+                "previous_error": failed_info['error']
+            }
+        else:
+            return {
+                "status": "not_found",
+                "model": model_alias,
+                "message": f"Model '{model_alias}' has no failure record."
+            }
+
+
+@router.get(
+    "/models/failed",
+    summary="List failed models"
+)
+async def get_failed_models(
+    manager: ModelManager = Depends(get_manager)
+):
+    """
+    Get list of models that have failed to start.
+
+    Returns:
+        List of failed models with error details.
+    """
+    if not manager:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model manager not available"
+        )
+
+    async with manager.lock:
+        if not manager.failed_models:
+            return {
+                "failed_models": [],
+                "message": "No failed models"
+            }
+
+        return {
+            "failed_models": [
+                {
+                    "model": alias,
+                    "attempts": info["attempts"],
+                    "error": info["error"][:200]
+                }
+                for alias, info in manager.failed_models.items()
+            ]
+        }
+
+
+@router.get(
+    "/queue/stats",
+    summary="Get queue statistics"
+)
+async def get_queue_stats(
+    manager: ModelManager = Depends(get_manager)
+):
+    """
+    Get detailed statistics for all model queues.
+
+    Returns:
+        Queue length, total processed, rejection count, and processing status.
+    """
+    from ..lifecycle.dependencies import get_queue_manager
+    queue_manager = get_queue_manager()
+
+    if not queue_manager:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Queue manager not available"
+        )
+
+    stats = queue_manager.get_all_stats()
+
+    # Add summary
+    total_queued = sum(q.get("queue_length", 0) for q in stats.values())
+    total_processing = sum(q.get("current_processing", 0)
+                           for q in stats.values())
+    total_processed = sum(q.get("total_processed", 0) for q in stats.values())
+    total_rejected = sum(q.get("total_rejected", 0) for q in stats.values())
+
+    return {
+        "summary": {
+            "total_queued": total_queued,
+            "total_processing": total_processing,
+            "total_processed": total_processed,
+            "total_rejected": total_rejected
+        },
+        "per_model": stats
+    }

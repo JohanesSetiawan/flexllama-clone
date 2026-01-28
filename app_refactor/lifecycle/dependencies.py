@@ -35,6 +35,8 @@ from ..core.queue import QueueManager
 from ..services.warmup_service import WarmupService
 from ..services.telemetry_service import TelemetryService
 from ..services.health_service import HealthService
+from ..services.cache_service import CacheService
+from ..services.redis_queue_service import RedisQueueService
 from ..core.model_status import ModelStatusTracker
 from ..services.metrics_service import MetricsService
 
@@ -71,6 +73,8 @@ class AppContainer:
     health_service: Optional[HealthService] = None
     status_tracker: Optional[ModelStatusTracker] = None
     metrics_service: Optional[MetricsService] = None
+    cache_service: Optional[CacheService] = None
+    redis_queue_service: Optional[RedisQueueService] = None
     http_client: Optional[httpx.AsyncClient] = None
     shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
     gpu_handle: Optional[Any] = None
@@ -138,6 +142,57 @@ def get_status_tracker() -> Optional[ModelStatusTracker]:
 def get_metrics_service() -> Optional[MetricsService]:
     """Get MetricsService instance."""
     return get_container().metrics_service
+
+
+def get_vram_service():
+    """Get VRAMService instance from manager."""
+    manager = get_container().manager
+    if manager:
+        return manager.vram_service
+    return None
+
+
+def get_proxy_service():
+    """
+    Get or create ProxyService instance.
+
+    ProxyService is created on-demand with required dependencies.
+    """
+    from ..services.proxy_service import ProxyService
+
+    container = get_container()
+    if not all([container.manager, container.queue_manager,
+                container.http_client, container.config]):
+        return None
+
+    return ProxyService(
+        manager=container.manager,
+        queue_manager=container.queue_manager,
+        http_client=container.http_client,
+        config=container.config,
+        warmup_service=container.warmup_service,
+        cache_service=container.cache_service
+    )
+
+
+def get_embeddings_service():
+    """
+    Get or create EmbeddingsService instance.
+
+    EmbeddingsService is created on-demand with required dependencies.
+    """
+    from ..services.embeddings_service import EmbeddingsService
+
+    container = get_container()
+    if not all([container.manager, container.http_client, container.config]):
+        return None
+
+    return EmbeddingsService(
+        manager=container.manager,
+        http_client=container.http_client,
+        config=container.config,
+        cache_service=container.cache_service
+    )
 
 
 def get_http_client() -> Optional[httpx.AsyncClient]:

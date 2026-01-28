@@ -67,13 +67,22 @@ async def shutdown_handler() -> None:
     # Step 5: Wait for active requests to drain
     await _wait_for_active_requests(container)
 
-    # Step 6: Stop all model runners
+    # Step 6: Stop VRAM service monitoring
+    await _stop_vram_service(container)
+
+    # Step 7: Stop all model runners
     await _stop_all_runners(container)
 
-    # Step 7: Close HTTP client
+    # Step 8: Close cache service
+    await _close_cache_service(container)
+
+    # Step 8.5: Close Redis queue service
+    await _close_redis_queue_service(container)
+
+    # Step 9: Close HTTP client
     await _close_http_client(container)
 
-    # Step 8: Shutdown GPU monitoring
+    # Step 10: Shutdown GPU monitoring
     _shutdown_gpu(container)
 
     logger.info("Application shutdown complete")
@@ -148,6 +157,20 @@ async def _wait_for_active_requests(container) -> None:
         await asyncio.sleep(1)
 
 
+async def _stop_vram_service(container) -> None:
+    """Stop VRAM service monitoring."""
+    if not container.manager:
+        return
+
+    if hasattr(container.manager, 'vram_service') and container.manager.vram_service:
+        logger.info("Stopping VRAM service monitoring")
+        try:
+            container.manager.vram_service.stop_monitoring()
+            logger.info("VRAM service monitoring stopped")
+        except Exception as e:
+            logger.warning(f"Error stopping VRAM service: {e}")
+
+
 async def _stop_all_runners(container) -> None:
     """Stop all model runners."""
     if not container.manager:
@@ -179,6 +202,32 @@ async def _force_kill_runners(container) -> None:
                     logger.warning(f"Force killed runner: {runner.alias}")
                 except Exception as e:
                     logger.error(f"Error killing runner {runner.alias}: {e}")
+
+
+async def _close_cache_service(container) -> None:
+    """Close the Redis cache service connection."""
+    if not container.cache_service:
+        return
+
+    logger.info("Closing cache service")
+    try:
+        await container.cache_service.disconnect()
+        logger.info("Cache service closed")
+    except Exception as e:
+        logger.warning(f"Error closing cache service: {e}")
+
+
+async def _close_redis_queue_service(container) -> None:
+    """Close the Redis queue service connection."""
+    if not container.redis_queue_service:
+        return
+
+    logger.info("Closing Redis queue service")
+    try:
+        await container.redis_queue_service.disconnect()
+        logger.info("Redis queue service closed")
+    except Exception as e:
+        logger.warning(f"Error closing Redis queue service: {e}")
 
 
 async def _close_http_client(container) -> None:

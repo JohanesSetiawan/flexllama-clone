@@ -1,5 +1,5 @@
-# Ignore config files - harus di-mount dari luar
-config.json
+# Ignore local dev config - Docker uses its own config.json
+konfig.json
 configOriginal.json
 
 # Ignore models - harus di-mount dari luar

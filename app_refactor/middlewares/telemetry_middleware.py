@@ -69,6 +69,7 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
         request.state.start_time = start_time
         request.state.tokens_generated = 0
+        request.state.input_tokens = 0
         request.state.model_alias = None
         request.state.queue_time = 0.0
         request.state.processing_time = 0.0
@@ -77,10 +78,28 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         if request.url.path in SKIP_ENDPOINTS:
             return await call_next(request)
 
+        # Get metrics service
+        metrics_service = get_metrics_service()
+
         try:
             response = await call_next(request)
 
-            # Record successful request
+            # Get model alias after request processing
+            model_alias = getattr(
+                request.state, 'model_alias', None) or "unknown"
+
+            # Record input/output tokens if available (before record_request)
+            if metrics_service and model_alias != "unknown":
+                input_tokens = getattr(request.state, 'input_tokens', 0)
+                output_tokens = getattr(request.state, 'tokens_generated', 0)
+                if input_tokens > 0:
+                    metrics_service.record_input_tokens(
+                        model_alias, input_tokens)
+                if output_tokens > 0:
+                    metrics_service.record_output_tokens(
+                        model_alias, output_tokens)
+
+            # Record successful request (this calls record_request_end internally)
             await self._record_request(
                 request=request,
                 request_id=request_id,

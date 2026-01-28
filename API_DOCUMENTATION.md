@@ -55,7 +55,35 @@ All inference endpoints are designed to be drop-in replacements for OpenAI's API
 
 ## Authentication
 
-Currently, the API does not require authentication. For production deployments, it is recommended to place the router behind a reverse proxy (nginx, Traefik) with authentication middleware.
+The API supports optional Bearer token authentication.
+
+### Enabling Authentication
+
+1. Set `API_KEY` in your `.env` file:
+
+```bash
+API_KEY=your_secret_key_here
+```
+
+2. Include the token in requests:
+
+```bash
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer your_secret_key_here"
+```
+
+### Disabling Authentication
+
+If `API_KEY` is not set or empty, authentication is completely disabled and all requests are allowed.
+
+### Public Endpoints
+
+These endpoints always bypass authentication:
+
+- `/docs` - OpenAPI documentation
+- `/redoc` - ReDoc documentation
+- `/openapi.json` - OpenAPI schema
+- `/health` - Health check
 
 ---
 

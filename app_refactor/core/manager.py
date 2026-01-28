@@ -311,7 +311,6 @@ class RunnerProcess:
     def _get_optimal_parallel(self) -> int:
         """Get optimal parallel setting, using cache if available."""
         model_path = self.config.get_resolved_path()
-        params = self.config.params
 
         if model_path in self._gguf_cache:
             parallel, model_info = self._gguf_cache[model_path]
@@ -319,16 +318,13 @@ class RunnerProcess:
             logger.debug(f"[{self.alias}] Using cached GGUF metadata")
             return parallel
 
-        # Calculate optimal parallel
-        base_parallel = (
-            params.parallel_override
-            if params.parallel_override
-            else self.system_config.parallel_requests
-        )
+        # Calculate optimal parallel using helper method
+        base_parallel = self.config.get_parallel(
+            self.system_config.default_parallel)
 
         parallel, parallel_reason = get_optimal_parallel(
             model_path=model_path,
-            n_ctx=params.n_ctx,
+            n_ctx=self.config.get_ctx_size(),
             default_parallel=base_parallel,
             min_ctx_per_slot=2048
         )
@@ -357,67 +353,40 @@ class RunnerProcess:
         return parallel
 
     def _build_command(self, parallel: int) -> List[str]:
-        """Build the llama-server command line."""
-        params = self.config.params
+        """
+        Build the llama-server command line.
+
+        Uses flags array from config - only adds essential flags
+        (model, host, port) that are managed by the system.
+        All other flags come directly from user config.
+        """
         model_path = self.config.get_resolved_path()
 
+        # Base command with system-managed flags only
         command = [
             self.llama_server_path,
             "--model", model_path,
             "--host", "127.0.0.1",
             "--port", str(self.port),
-            "--n-gpu-layers", str(params.n_gpu_layers),
-            "--ctx-size", str(params.n_ctx),
-            "--mlock",
-            "--jinja"
         ]
 
-        # Context shifting: disable for non-SWA models
+        # Add --parallel if not specified in flags
+        if "--parallel" not in self.config.flags:
+            command.extend(["--parallel", str(parallel)])
+
+        # Context shifting: disable for non-SWA models (internal logic)
         if self.model_info and not self.model_info.is_swa:
-            command.append("--no-context-shift")
+            if "--no-context-shift" not in self.config.flags:
+                command.append("--no-context-shift")
             logger.info(
-                f"[{self.alias}] Non-SWA model. Context shifting DISABLED"
-            )
+                f"[{self.alias}] Non-SWA model. Context shifting DISABLED")
         else:
-            logger.info(
-                f"[{self.alias}] SWA model. Context shifting ENABLED"
-            )
+            logger.info(f"[{self.alias}] SWA model. Context shifting ENABLED")
 
-        # RoPE frequency base (only if set)
-        if params.rope_freq_base is not None and params.rope_freq_base > 0:
-            command.extend(["--rope-freq-base", str(params.rope_freq_base)])
-
-        # Batch size (with per-model override)
-        batch_size = params.batch_override or params.n_batch
-        command.extend(["--batch-size", str(batch_size)])
-
-        # Parallel requests
-        command.extend(["--parallel", str(parallel)])
-
-        # CPU threads
-        command.extend(["--threads", str(self.system_config.cpu_threads)])
-
-        # Flash Attention
-        command.extend(["-fa", self.system_config.flash_attention])
-
-        # Memory mapping
-        if not self.system_config.use_mmap:
-            command.append("--no-mmap")
-
-        # Embedding mode
-        if params.embedding:
-            command.append("--embedding")
-
-        # Chat template
-        if params.chat_template:
-            command.extend(["--chat-template", params.chat_template])
-
-        # Cache types
-        if params.type_k and params.type_k.lower() != "none":
-            command.extend(["--cache-type-k", params.type_k])
-
-        if params.type_v and params.type_v.lower() != "none":
-            command.extend(["--cache-type-v", params.type_v])
+        # Append all user-defined flags directly
+        if self.config.flags:
+            command.extend(self.config.flags)
+            logger.info(f"[{self.alias}] Flags: {' '.join(self.config.flags)}")
 
         return command
 
@@ -857,7 +826,7 @@ class ModelManager:
         model_size_mb: float
     ) -> float:
         """Estimate VRAM needed for a model."""
-        n_ctx = model_conf.params.n_ctx
+        n_ctx = model_conf.get_ctx_size()
         vram_multiplier = self.config.system.vram_multiplier
 
         # Base estimation

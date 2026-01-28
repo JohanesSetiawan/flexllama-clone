@@ -255,7 +255,7 @@ class WarmupService:
         total: int
     ) -> None:
         """Log successful model load with VRAM info."""
-        vram_report = self.manager.vram_tracker.get_vram_report()
+        vram_report = self.manager.vram_service.get_vram_report()
         logger.info(
             f"[Preload] [{index}/{total}] SUCCESS | "
             f"'{model_alias}' loaded at {runner.url} (took {load_time:.1f}s) | "
@@ -413,7 +413,7 @@ class WarmupService:
             f"Failed: {failed} | Skipped: {skipped}"
         )
 
-        vram_report = self.manager.vram_tracker.get_vram_report()
+        vram_report = self.manager.vram_service.get_vram_report()
         logger.info(
             f"[Preload] VRAM STATUS | "
             f"Used: {vram_report['gpu_info']['used_gb']:.2f} GB | "
@@ -528,9 +528,9 @@ class WarmupService:
     async def preload_models(self) -> None:
         """Preload models using appropriate strategy."""
         max_concurrent = self.config.system.max_concurrent_models
-        use_parallel = max_concurrent > 1 and self.config.system.use_mmap
 
-        if use_parallel:
+        # Use queued loading when multiple concurrent models are allowed
+        if max_concurrent > 1:
             batch_size = min(2, max_concurrent)
             logger.info(
                 f"[Preload] Using QUEUED loading (batch size {batch_size})")

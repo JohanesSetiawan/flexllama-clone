@@ -21,18 +21,21 @@ import time
 import heapq
 import asyncio
 import logging
-from typing import Dict, Any, Optional, List, AsyncGenerator
+from typing import Dict, Any, Optional, List, AsyncGenerator, TYPE_CHECKING
 
 import httpx
 from fastapi import Request, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.config import AppConfig
-from ..core.manager import ModelManager
 from ..core.queue import QueueManager, QueuedRequest, RequestPriority, ModelRequestQueue
 from ..core.errors import InsufficientVRAMError
 from ..services.metrics_service import get_metrics_service, MetricsService
 from ..services.warmup_service import WarmupService
+from ..services.cache_service import CacheService, get_cache_service
+
+if TYPE_CHECKING:
+    from ..core.manager import ModelManager
 
 
 logger = logging.getLogger(__name__)
@@ -58,17 +61,19 @@ class ProxyService:
 
     def __init__(
         self,
-        manager: ModelManager,
+        manager: "ModelManager",
         queue_manager: QueueManager,
         http_client: httpx.AsyncClient,
         config: AppConfig,
-        warmup_service: Optional[WarmupService] = None
+        warmup_service: Optional[WarmupService] = None,
+        cache_service: Optional[CacheService] = None
     ):
         self.manager = manager
         self.queue_manager = queue_manager
         self.http_client = http_client
         self.config = config
         self.warmup_service = warmup_service
+        self.cache_service = cache_service or get_cache_service()
 
     async def proxy_chat_completion(
         self,
@@ -102,12 +107,28 @@ class ProxyService:
             # Determine streaming mode
             is_streaming = body.get("stream", False)
 
+            # Check cache first (non-streaming only)
+            if self.cache_service and not is_streaming:
+                cached_response = await self.cache_service.get(model_alias, body)
+                if cached_response:
+                    logger.info(f"[Proxy] Cache HIT for {model_alias}")
+                    request.state.queue_time = 0
+                    request.state.tokens_generated = cached_response.get(
+                        "usage", {}
+                    ).get("completion_tokens", 0)
+                    return JSONResponse(content=cached_response, status_code=200)
+
             # Get priority from header
             priority = self._get_priority(request)
 
             # Record request for warmup tracking
             if self.warmup_service:
                 self.warmup_service.record_request(model_alias)
+
+            # Record request start for active requests tracking (BEFORE queue)
+            prom_collector = get_metrics_service()
+            if prom_collector:
+                prom_collector.record_request_start(model_alias)
 
             # Get queue for model
             queue = await self.queue_manager.get_queue(model_alias)
@@ -126,18 +147,35 @@ class ProxyService:
             try:
                 queue_timeout = self.config.system.queue_timeout_sec * 3
 
-                result = await self._process_request_via_queue(
-                    queue=queue,
-                    request_id=request_id,
-                    model_alias=model_alias,
-                    body=body,
-                    priority=priority,
-                    endpoint=endpoint,
-                    timeout=queue_timeout
-                )
+                # Use Redis queue if enabled, otherwise in-memory
+                if self.queue_manager.use_redis and not is_streaming:
+                    # Redis queue path (for non-streaming only)
+                    result = await self._process_via_redis_queue(
+                        request_id=request_id,
+                        model_alias=model_alias,
+                        body=body,
+                        priority=priority,
+                        endpoint=endpoint,
+                        timeout=queue_timeout
+                    )
+                else:
+                    # In-memory queue path (streaming or Redis disabled)
+                    result = await self._process_request_via_queue(
+                        queue=queue,
+                        request_id=request_id,
+                        model_alias=model_alias,
+                        body=body,
+                        priority=priority,
+                        endpoint=endpoint,
+                        timeout=queue_timeout
+                    )
 
                 # Record queue time
                 request.state.queue_time = time.time() - queue_start_time
+
+                # Cache non-streaming responses for future requests
+                if self.cache_service and not is_streaming and result["type"] == "json":
+                    await self.cache_service.set(model_alias, body, result["data"])
 
                 # Handle response
                 return self._create_response(result, request)
@@ -187,6 +225,7 @@ class ProxyService:
             return self._create_streaming_response(result)
         else:
             request.state.tokens_generated = result.get("tokens", 0)
+            request.state.input_tokens = result.get("input_tokens", 0)
             return JSONResponse(
                 content=result["data"],
                 status_code=result["status_code"]
@@ -196,18 +235,14 @@ class ProxyService:
         self,
         result: Dict[str, Any]
     ) -> StreamingResponse:
-        """Create streaming response from chunks."""
-        async def stream_generator():
-            try:
-                for chunk in result["chunks"]:
-                    yield chunk
-            except Exception as e:
-                logger.error(f"Error in stream generator: {e}")
-                error_chunk = 'data: {"error": "Stream error"}\n\n'
-                yield error_chunk.encode()
+        """
+        Create streaming response from async generator.
 
+        Uses true passthrough - chunks are yielded as received
+        without buffering for minimal latency.
+        """
         return StreamingResponse(
-            stream_generator(),
+            result["generator"],
             status_code=result["status_code"],
             media_type="text/event-stream"
         )
@@ -342,6 +377,166 @@ class ProxyService:
                     pass
             raise TimeoutError(f"Request timeout after {timeout}s in queue")
 
+    async def _process_via_redis_queue(
+        self,
+        request_id: str,
+        model_alias: str,
+        body: Dict[str, Any],
+        priority: RequestPriority,
+        endpoint: str,
+        timeout: float
+    ) -> Dict[str, Any]:
+        """
+        Process request via Redis queue with result polling.
+
+        Steps:
+        1. Enqueue to Redis Sorted Set
+        2. Ensure processor is running
+        3. Poll for result with timeout
+        """
+        # Enqueue to Redis
+        await self.queue_manager.enqueue_redis(
+            model_alias=model_alias,
+            request_id=request_id,
+            body={**body, "_endpoint": endpoint},
+            priority=priority
+        )
+
+        logger.info(
+            f"[Redis Queue] Enqueued {request_id} for {model_alias} "
+            f"(priority: {priority.name})"
+        )
+
+        # Ensure processor is running for this model
+        await self._ensure_redis_processor_running(model_alias, endpoint)
+
+        # Poll for result
+        poll_interval = 0.1  # 100ms
+        start_time = time.time()
+
+        while True:
+            result = await self.queue_manager.get_result_redis(request_id)
+
+            if result:
+                # Check for error result (TTL expired)
+                if "error" in result:
+                    if result["error"] == "timeout":
+                        raise TimeoutError(result.get(
+                            "detail", "Request expired in queue"))
+                    else:
+                        raise RuntimeError(result.get(
+                            "detail", str(result["error"])))
+
+                logger.debug(f"[Redis Queue] Got result for {request_id}")
+                return result
+
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                raise TimeoutError(
+                    f"Request timeout after {timeout}s waiting for result")
+
+            # Wait before next poll
+            await asyncio.sleep(poll_interval)
+
+    async def _ensure_redis_processor_running(
+        self,
+        model_alias: str,
+        endpoint: str
+    ) -> None:
+        """Ensure Redis queue processor is running for a model."""
+        # Use a simple tracking dict to avoid duplicate processors
+        if not hasattr(self, '_redis_processors'):
+            self._redis_processors: Dict[str, asyncio.Task] = {}
+
+        if model_alias in self._redis_processors:
+            task = self._redis_processors[model_alias]
+            if not task.done():
+                return
+
+        # Start new processor
+        logger.info(f"[Redis Queue] Starting processor for {model_alias}")
+        task = asyncio.create_task(
+            self._redis_queue_processor(model_alias, endpoint)
+        )
+        self._redis_processors[model_alias] = task
+
+    async def _redis_queue_processor(
+        self,
+        model_alias: str,
+        endpoint: str
+    ) -> None:
+        """
+        Background task to process Redis queue for a model.
+
+        Continuously polls Redis queue and processes requests.
+        """
+        logger.info(f"[Redis Queue] Processor started for '{model_alias}'")
+        idle_timeout = self.config.system.queue_processor_idle_sec
+        last_activity = time.time()
+
+        try:
+            while True:
+                # Dequeue from Redis
+                request_data = await self.queue_manager.dequeue_redis(model_alias)
+
+                if request_data is None:
+                    # Check idle timeout
+                    idle_time = time.time() - last_activity
+                    if idle_time >= idle_timeout:
+                        # Check if warm model
+                        if self.warmup_service and self.warmup_service.is_model_warm(model_alias):
+                            await asyncio.sleep(1)
+                            continue
+                        else:
+                            logger.info(
+                                f"[Redis Queue] Processor idle for {model_alias}, stopping"
+                            )
+                            break
+
+                    await asyncio.sleep(0.5)
+                    continue
+
+                last_activity = time.time()
+                request_id = request_data.get("request_id", "unknown")
+                body = request_data.get("body", {})
+                req_endpoint = body.pop("_endpoint", endpoint)
+
+                logger.info(
+                    f"[Redis Queue] Processing {request_id} for {model_alias}")
+
+                try:
+                    # Get runner and execute
+                    runner = await self.manager.get_runner_for_request(model_alias)
+                    result = await self._execute_request(
+                        body=body,
+                        request_id=request_id,
+                        model_alias=model_alias,
+                        runner=runner,
+                        endpoint=req_endpoint
+                    )
+
+                    # Store result in Redis
+                    await self.queue_manager.set_result_redis(request_id, result)
+
+                    logger.info(
+                        f"[Redis Queue] Request {request_id} completed")
+
+                except Exception as e:
+                    logger.exception(
+                        f"[Redis Queue] Error processing {request_id}: {e}")
+                    # Store error result
+                    await self.queue_manager.set_result_redis(request_id, {
+                        "error": "processing_error",
+                        "detail": str(e)
+                    })
+
+        except asyncio.CancelledError:
+            logger.info(f"[Redis Queue] Processor cancelled for {model_alias}")
+            raise
+        finally:
+            logger.info(f"[Redis Queue] Processor stopped for '{model_alias}'")
+
     async def _queue_processor(
         self,
         model_alias: str,
@@ -371,7 +566,7 @@ class ProxyService:
                         continue
                     except asyncio.TimeoutError:
                         # Check if warm model
-                        if self.warmup_manager and self.warmup_manager.is_model_warm(model_alias):
+                        if self.warmup_service and self.warmup_service.is_model_warm(model_alias):
                             continue
                         else:
                             logger.info(
@@ -493,15 +688,25 @@ class ProxyService:
         self,
         response: httpx.Response
     ) -> Dict[str, Any]:
-        """Handle streaming response from llama-server."""
-        chunks = []
-        async for chunk in response.aiter_bytes():
-            chunks.append(chunk)
-        await response.aclose()
+        """
+        Handle streaming response from llama-server.
+
+        Returns an async generator that yields chunks in real-time
+        for true streaming passthrough without buffering.
+        """
+        async def stream_generator():
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            except Exception as e:
+                logger.error(f"Streaming error: {e}")
+                yield f'data: {{"error": "{str(e)}"}}\n\n'.encode()
+            finally:
+                await response.aclose()
 
         return {
             "type": "stream",
-            "chunks": chunks,
+            "generator": stream_generator(),
             "status_code": response.status_code
         }
 
@@ -530,20 +735,23 @@ class ProxyService:
                     response_data['metadata'] = {}
                 response_data['metadata']['context_shifted'] = True
 
-        # Extract tokens
-        tokens = 0
+        # Extract tokens (input and output)
+        input_tokens = 0
+        output_tokens = 0
         if 'usage' in response_data:
-            tokens = response_data['usage'].get('completion_tokens', 0)
+            input_tokens = response_data['usage'].get('prompt_tokens', 0)
+            output_tokens = response_data['usage'].get('completion_tokens', 0)
         elif 'choices' in response_data and response_data['choices']:
             content_text = response_data['choices'][0].get(
                 'message', {}
             ).get('content', '')
-            tokens = len(content_text) // 4
+            output_tokens = len(content_text) // 4
 
         return {
             "type": "json",
             "data": response_data,
-            "tokens": tokens,
+            "tokens": output_tokens,
+            "input_tokens": input_tokens,
             "status_code": response.status_code,
             "context_shifted": context_shifted
         }

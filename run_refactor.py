@@ -5,22 +5,27 @@ This script initializes and runs the refactored Router Model application.
 It handles configuration loading, status server initialization, and starting the FastAPI app.
 """
 
-from app_refactor.main import create_app
-from app_refactor.status_server import init_status_file, run_status_server_thread
-from app_refactor.core.config import load_config
-import sys
-import argparse
-import threading
-import logging
-import uvicorn
+from app_refactor.core.logging_server import setup_logging
 from pathlib import Path
+import uvicorn
+import logging
+import threading
+import argparse
+import os
+import sys
+from app_refactor.core.config import load_config
+from app_refactor.status_server import init_status_file, run_status_server_thread
+from app_refactor.main import create_app
+from dotenv import load_dotenv
+
+# Load environment variables from .env file FIRST
+load_dotenv()
 
 # Adjust path to include current directory
 sys.path.append(str(Path(__file__).parent))
 
-
-# Setup basic logging for startup
-logging.basicConfig(level=logging.INFO)
+# Setup logging with timestamp and milliseconds format
+setup_logging(log_level=logging.INFO, use_structured=False)
 logger = logging.getLogger("runner")
 
 
@@ -54,9 +59,6 @@ def main():
         # 3. Start Status Server (Background Thread)
         stop_event = threading.Event()
         api_config = config.api
-        # Status server usually runs on a different port or same host?
-        # Original code used hardcoded 8001 or something?
-        # run.py used STATUS_SERVER_PORT = 8001. We'll use config or default.
         status_port = 8001
 
         status_thread = threading.Thread(
@@ -76,16 +78,11 @@ def main():
             f"Starting API Server at {api_config.host}:{api_config.port}")
 
         # We run uvicorn programmatically
-        # Note: 'workers' logic if needed, but for async apps usually 1 worker or process manager
-        # If we use reload=True, it might restart main() which creates issues with threads.
-        # We assume production mode (reload=False).
-
         uvicorn.run(
             app,
             host=api_config.host,
             port=api_config.port,
             log_level="info",
-            # Loop might need specification if conflicts with threading? uvicorn handles it.
         )
 
     except KeyboardInterrupt:

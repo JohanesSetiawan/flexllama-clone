@@ -77,3 +77,44 @@ async def liveness_probe():
         200 OK indicating the server is running.
     """
     return {"status": "alive"}
+
+
+@router.get(
+    "/v1/telemetry/summary",
+    summary="Get telemetry summary"
+)
+async def get_telemetry_summary(
+    health_service: HealthService = Depends(get_health_service)
+):
+    """
+    Get telemetry summary including request statistics.
+
+    Returns:
+        Telemetry data: request counts, latencies, errors.
+    """
+    from ..lifecycle.dependencies import get_telemetry
+    telemetry = get_telemetry()
+
+    if not telemetry:
+        return {"error": "Telemetry not available"}
+
+    return telemetry.get_summary()
+
+
+@router.get(
+    "/v1/health/models",
+    summary="Get all models health status"
+)
+async def get_models_health(
+    health_service: HealthService = Depends(get_health_service)
+):
+    """
+    Get health status for all active models.
+
+    Returns:
+        Health status per model.
+    """
+    if not health_service:
+        return {"error": "Health service not available"}
+
+    return health_service.get_all_health()

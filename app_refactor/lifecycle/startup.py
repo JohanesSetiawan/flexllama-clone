@@ -42,6 +42,8 @@ from ..core.queue import QueueManager
 from ..services.warmup_service import WarmupService
 from ..services.telemetry_service import TelemetryService
 from ..services.health_service import HealthService
+from ..services.cache_service import init_cache_service
+from ..services.redis_queue_service import init_redis_queue_service
 from ..core.model_status import init_status_tracker
 from ..services.metrics_service import init_metrics_service
 from ..core.logging_server import setup_logging
@@ -79,6 +81,24 @@ async def startup_handler() -> None:
             list(container.config.models.keys())
         )
 
+        # Step 2.5: Initialize Redis cache service
+        if container.config.redis:
+            logger.info("Initializing Redis Cache Service")
+            container.cache_service = await init_cache_service(container.config.redis)
+        else:
+            logger.info("Redis caching disabled (no redis config)")
+            container.cache_service = None
+
+        # Step 2.6: Initialize Redis queue service
+        if container.config.redis and container.config.redis.enable_redis_queue:
+            logger.info("Initializing Redis Queue Service")
+            container.redis_queue_service = await init_redis_queue_service(
+                container.config.redis
+            )
+        else:
+            logger.info("Redis queue disabled (using in-memory queue)")
+            container.redis_queue_service = None
+
         # Step 3: Initialize HTTP client
         logger.info("Initializing HTTP client")
         container.http_client = _create_http_client(container.config)
@@ -92,13 +112,16 @@ async def startup_handler() -> None:
 
         # Step 5: Initialize Queue Manager
         logger.info("Initializing QueueManager")
-        container.queue_manager = QueueManager(container.config)
+        container.queue_manager = QueueManager(
+            container.config,
+            redis_queue_service=container.redis_queue_service
+        )
 
         # Step 6: Initialize Warmup Service
         logger.info("Initializing WarmupService")
         container.warmup_service = WarmupService(
             manager=container.manager,
-            config=container.config.warmup,
+            config=container.config,
             shutdown_event=container.shutdown_event
         )
 
@@ -124,13 +147,13 @@ async def startup_handler() -> None:
             max_concurrent_models=container.config.system.max_concurrent_models
         )
 
-        # Step 11: Start warmup manager (preload models)
-        logger.info("Starting warmup manager")
-        await container.warmup_manager.start()
+        # Step 11: Start warmup service (preload models)
+        logger.info("Starting warmup service")
+        await container.warmup_service.start()
 
         # Step 12: Start health monitoring
         logger.info("Starting health monitoring")
-        container.health_monitor.start()
+        container.health_service.start()
 
         # Step 13: Start background tasks
         logger.info("Starting background tasks")
@@ -200,14 +223,38 @@ async def _start_background_tasks(container: AppContainer) -> None:
 
 async def _emergency_cleanup(container: AppContainer) -> None:
     """Emergency cleanup on startup failure."""
-    try:
-        if container.gpu_handle:
-            pynvml.nvmlShutdown()
-    except Exception:
-        pass
+    logger.info("Performing emergency cleanup...")
 
-    try:
-        if container.http_client:
+    # Stop manager (will stop runners and VRAM service)
+    if container.manager:
+        try:
+            await container.manager.stop_all_runners()
+            logger.info("Stopped all runners during emergency cleanup")
+        except Exception as e:
+            logger.warning(f"Error stopping runners: {e}")
+
+        # Stop VRAM service monitoring
+        if hasattr(container.manager, 'vram_service') and container.manager.vram_service:
+            try:
+                container.manager.vram_service.stop_monitoring()
+                logger.info("Stopped VRAM monitoring during emergency cleanup")
+            except Exception as e:
+                logger.warning(f"Error stopping VRAM monitoring: {e}")
+
+    # Shutdown GPU/NVML
+    if container.gpu_handle:
+        try:
+            pynvml.nvmlShutdown()
+            logger.info("NVML shutdown during emergency cleanup")
+        except Exception:
+            pass
+
+    # Close HTTP client
+    if container.http_client:
+        try:
             await container.http_client.aclose()
-    except Exception:
-        pass
+            logger.info("HTTP client closed during emergency cleanup")
+        except Exception:
+            pass
+
+    logger.info("Emergency cleanup complete")

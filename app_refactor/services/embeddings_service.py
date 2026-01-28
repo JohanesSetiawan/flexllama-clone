@@ -18,15 +18,18 @@ Usage:
 
 import time
 import logging
-from typing import List, Union, Dict, Any
+from typing import List, Union, Dict, Any, TYPE_CHECKING
 
 import httpx
 from fastapi import Request, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from ..core.config import AppConfig
-from ..core.manager import ModelManager
 from .warmup_service import WarmupService
+from .cache_service import CacheService, get_cache_service
+
+if TYPE_CHECKING:
+    from ..core.manager import ModelManager
 
 
 logger = logging.getLogger(__name__)
@@ -50,15 +53,17 @@ class EmbeddingsService:
 
     def __init__(
         self,
-        manager: ModelManager,
+        manager: "ModelManager",
         http_client: httpx.AsyncClient,
         config: AppConfig,
-        warmup_service: Union[WarmupService, None] = None
+        warmup_service: Union[WarmupService, None] = None,
+        cache_service: Union[CacheService, None] = None
     ):
         self.manager = manager
         self.http_client = http_client
         self.config = config
         self.warmup_service = warmup_service
+        self.cache_service = cache_service or get_cache_service()
 
     async def generate_embeddings(
         self,
@@ -102,11 +107,11 @@ class EmbeddingsService:
                     detail=f"Model '{model_alias}' not found in config"
                 )
 
-            if not model_config.params.embedding:
+            if not model_config.is_embedding_mode():
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Model '{model_alias}' does not support embeddings. "
-                    f"Set 'embedding: true' in config."
+                    f"Add '--embedding' to flags in config."
                 )
 
             # Get input text(s)
@@ -128,10 +133,11 @@ class EmbeddingsService:
             queue_start = time.time()
             runner = await self.manager.get_runner_for_request(model_alias)
 
-            # Generate embeddings
+            # Generate embeddings (with caching)
             embeddings, total_tokens = await self._generate_batch(
                 runner=runner,
-                inputs=inputs
+                inputs=inputs,
+                model_alias=model_alias
             )
 
             # Record timing
@@ -204,14 +210,16 @@ class EmbeddingsService:
     async def _generate_batch(
         self,
         runner,
-        inputs: List[str]
+        inputs: List[str],
+        model_alias: str = ""
     ) -> tuple[List[Dict[str, Any]], int]:
         """
-        Generate embeddings for a batch of inputs.
+        Generate embeddings for a batch of inputs with caching.
 
         Args:
             runner: RunnerProcess instance
             inputs: List of text strings
+            model_alias: Model identifier for cache key
 
         Returns:
             Tuple of (embeddings list, total tokens)
@@ -221,9 +229,25 @@ class EmbeddingsService:
         total_tokens = 0
 
         for idx, text in enumerate(inputs):
-            # llama-server expects {"content": "text"}
-            embed_body = {"content": text}
+            # Check cache first
+            cache_key_body = {"input": text, "model": model_alias}
+            cached = None
+            if self.cache_service:
+                cached = await self.cache_service.get(model_alias, cache_key_body)
 
+            if cached and "embedding" in cached:
+                # Cache HIT
+                logger.debug(f"[Embedding] Cache HIT for text index {idx}")
+                all_embeddings.append({
+                    "object": "embedding",
+                    "embedding": cached["embedding"],
+                    "index": idx
+                })
+                total_tokens += len(text) // 4
+                continue
+
+            # Cache MISS - compute embedding
+            embed_body = {"content": text}
             req = self.http_client.build_request(
                 method="POST",
                 url=internal_url,
@@ -242,16 +266,22 @@ class EmbeddingsService:
 
             result = response.json()
 
-            # llama-server returns list directly or dict with "embedding"
+            # Parse response format
             if isinstance(result, list):
                 embedding = result
             elif isinstance(result, dict):
                 embedding = result.get("embedding", [])
             else:
-                logger.error(
-                    f"Unexpected embedding response format: {type(result)}"
-                )
+                logger.error(f"Unexpected embedding response: {type(result)}")
                 embedding = []
+
+            # Store in cache
+            if self.cache_service and embedding:
+                await self.cache_service.set(
+                    model_alias,
+                    cache_key_body,
+                    {"embedding": embedding}
+                )
 
             all_embeddings.append({
                 "object": "embedding",
@@ -259,7 +289,6 @@ class EmbeddingsService:
                 "index": idx
             })
 
-            # Estimate tokens (~1 token per 4 chars)
             total_tokens += len(text) // 4
 
         return all_embeddings, total_tokens
