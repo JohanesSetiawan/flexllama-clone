@@ -16,29 +16,51 @@ RouterModelCustom is middleware between client applications and `llama-server` i
 
 ## Table of Contents
 
-- [Features](#features)
-- [Architecture Overview](#architecture-overview)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Configuration](#configuration)
-- [Usage](#usage)
-  - [Starting the Server](#starting-the-server)
-  - [Making Requests](#making-requests)
-  - [Priority Queue](#priority-queue)
-  - [Streaming Responses](#streaming-responses)
-- [Monitoring](#monitoring)
-  - [Quick Start (Docker)](#quick-start-docker)
-  - [Access Dashboards](#access-dashboards)
-  - [Prometheus Metrics](#prometheus-metrics)
-- [API Reference](#api-reference)
-  - [OpenAI Compatible](#openai-compatible)
-  - [Management](#management)
-  - [Monitoring Endpoints](#monitoring-endpoints)
-  - [Realtime Status (SSE)](#realtime-status-sse)
-- [Configuration Reference](#configuration-reference)
-- [Project Structure](#project-structure)
-- [Technologies Used](#technologies-used)
+- [RouterModelCustom](#routermodelcustom)
+  - [Table of Contents](#table-of-contents)
+  - [Features](#features)
+  - [Architecture Overview](#architecture-overview)
+  - [Getting Started](#getting-started)
+    - [Prerequisites](#prerequisites)
+    - [Installation](#installation)
+      - [1. Clone the Repository](#1-clone-the-repository)
+      - [2. Create Virtual Environment](#2-create-virtual-environment)
+      - [3. Install Dependencies](#3-install-dependencies)
+      - [4. Prepare llama-server](#4-prepare-llama-server)
+    - [Configuration](#configuration)
+      - [1. Create Config File](#1-create-config-file)
+      - [2. Edit Configuration](#2-edit-configuration)
+      - [3. (Optional) Enable API Key Authentication](#3-optional-enable-api-key-authentication)
+      - [4. Docker Deployment (Recommended)](#4-docker-deployment-recommended)
+  - [Usage](#usage)
+    - [Starting the Server](#starting-the-server)
+    - [Making Requests](#making-requests)
+      - [Chat Completion](#chat-completion)
+      - [Embeddings](#embeddings)
+      - [List Available Models](#list-available-models)
+    - [Priority Queue](#priority-queue)
+    - [Streaming Responses](#streaming-responses)
+  - [Monitoring](#monitoring)
+    - [Quick Start (Docker)](#quick-start-docker)
+    - [Access Dashboards](#access-dashboards)
+    - [Prometheus Metrics](#prometheus-metrics)
+    - [Stop Monitoring](#stop-monitoring)
+  - [API Reference](#api-reference)
+    - [OpenAI Compatible](#openai-compatible)
+    - [Management](#management)
+    - [Monitoring Endpoints](#monitoring-endpoints)
+    - [Realtime Status (SSE)](#realtime-status-sse)
+      - [Get All Model Status](#get-all-model-status)
+      - [Stream Status Updates](#stream-status-updates)
+  - [Configuration Reference](#configuration-reference)
+    - [Environment Variables](#environment-variables)
+    - [System Configuration (`system`)](#system-configuration-system)
+    - [Model Configuration (`models.{alias}`)](#model-configuration-modelsalias)
+      - [Common Flags](#common-flags)
+  - [Project Structure](#project-structure)
+    - [Original Structure (app/)](#original-structure-app)
+    - [Refactored Structure (app\_refactor/)](#refactored-structure-app_refactor)
+  - [Technologies Used](#technologies-used)
 
 ---
 
@@ -236,7 +258,7 @@ If `API_KEY` is set, requests must include `Authorization: Bearer <key>` header.
 
 The application automatically detects the environment and uses the appropriate `llama-server` path:
 
-- **Local Development**: Uses path from `konfig.json` (e.g., `/home/user/llama.cpp/build/bin/llama-server`)
+- **Local Development**: Uses path from `config.json` (e.g., `/home/user/llama.cpp/build/bin/llama-server`)
 - **Docker Container**: Automatically uses `/app/llama-server` from the base image
 
 **Build and Run:**
@@ -516,7 +538,7 @@ The application supports environment variable overrides for flexible deployment:
 
 **Example:**
 ```bash
-# Local development - uses konfig.json
+# Local development - uses config.json
 python run_refactor.py
 
 # Docker - ENV variables auto-set
